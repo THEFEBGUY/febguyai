@@ -1,0 +1,72 @@
+﻿# Secrets / API keys
+.env
+.env.*
+backend/.env
+backend/.env.*
+frontend/.env
+frontend/.env.*
+
+# Python cache
+__pycache__/
+backend/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+archive/
+
+# Backend database / private files
+backend/*.db
+backend/*.db-shm
+backend/*.db-wal
+backend/*.db.bak*
+backend/profiles/
+backend/sessions.json
+backend/profiles.json
+backend/*.broken
+
+# Uploaded / processed user files
+backend/processed_files/
+backend/uploaded_image.txt
+backend/pdf_memory.txt
+backend/voice file.txt
+
+# Backup files
+*.bak*
+*.bak-*
+backend/*.bak*
+backend/main.py.bak*
+*.vscodefix*
+frontend/*.bak*
+frontend/src/*.bak*
+
+# Frontend dependencies/build
+node_modules/
+frontend/node_modules/
+dist/
+build/
+frontend/dist/
+frontend/build/
+.vite/
+frontend/.vite/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local temporary/test files
+test.py
+format.txt
+febguy_main_py.txt
+idea of website.png
+old website.PNG

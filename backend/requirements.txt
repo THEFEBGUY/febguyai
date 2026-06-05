@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+pillow
+pydantic
+pypdf
+pymupdf
+pytesseract
+ddgs
+ilovepdf
+python-multipart
+psycopg[binary]>=3.2.0
