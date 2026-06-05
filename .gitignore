@@ -23,6 +23,8 @@ backend/profiles/
 backend/sessions.json
 backend/profiles.json
 backend/*.broken
+backend/chats.json
+backend/memory.json
 
 # Uploaded / processed user files
 backend/processed_files/
