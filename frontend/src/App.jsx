@@ -355,10 +355,13 @@ const defaultSettings = {
 };
 
 function StarterPromptIcon({ label }) {
+  if (label === "Build") {
+    return <PlusIcon />;
+  }
   if (label === "Research") {
     return <SearchIcon />;
   }
-  if (label === "Document") {
+  if (label === "Analyze" || label === "Document") {
     return <AttachIcon />;
   }
   if (label === "Quiz") {
@@ -372,25 +375,25 @@ function StarterPromptIcon({ label }) {
 
 const starterPrompts = [
   {
+    label: "Build",
+    title: "Build with FebGuy",
+    prompt: "Help me plan and build a useful AI-powered project step by step."
+  },
+  {
     label: "Study",
-    title: "Explain a topic",
-    prompt: "Explain computer networking basics in simple language with examples."
+    title: "Study Smarter",
+    prompt: "Explain a topic clearly, then create quick practice questions for me."
+  },
+  {
+    label: "Analyze",
+    title: "Analyze Files",
+    prompt: "I want to upload a file. Tell me what you can analyze from it."
   },
   {
     label: "Research",
-    title: "Search the web",
-    prompt: "Search the web for the latest useful AI tools for students and summarize with sources."
+    title: "Research with Sources",
+    prompt: "Search the web for the latest reliable information and summarize it with sources."
   },
-  {
-    label: "Quiz",
-    title: "Practice Quiz",
-    prompt: "Create quiz questions from a topic so I can practice."
-  },
-  {
-    label: "Document",
-    title: "Analyze a file",
-    prompt: "I want to upload a file. Tell me what you can analyze from it."
-  }
 ];
 
 const codeStarterPrompts = [
@@ -2984,6 +2987,31 @@ function App() {
     regenerateLastResponse(nextAnswerLength);
   };
 
+  const sendResponseFollowUp = async (followUpText) => {
+    if (isBusy || !followUpText) {
+      return;
+    }
+
+    setMessageActionMenuKey("");
+
+    try {
+      await sendToBackend(followUpText, null, false);
+    } catch (error) {
+      setLoading(false);
+      setProcessingFile(false);
+      if (error?.name === "AbortError") {
+        return;
+      }
+      await loadGuestLimits(undefined, sessionMode === "guest");
+      const errorMessage = formatClientError(error, "Backend Error. Please check FastAPI, internet access, and backend .env API keys.");
+      if (isGuestLimitMessage(errorMessage)) {
+        await showGuestLimitReached();
+        return;
+      }
+      appendAiMessage(errorMessage, workspace);
+    }
+  };
+
   const viewSources = (messageKey, citations) => {
     setMessageActionMenuKey("");
     setDocumentsDrawer(null);
@@ -4700,15 +4728,18 @@ function App() {
                               <RegenerateIcon />
                               Regenerate
                             </button>
-                            <span className="more-menu-label">Response length</span>
-                            <button type="button" role="menuitem" onClick={() => regenerateWithLength("short")} disabled={isBusy}>
-                              Make shorter
+                            <span className="more-menu-label">Refine answer</span>
+                            <button type="button" role="menuitem" onClick={() => sendResponseFollowUp("Explain your previous answer in simpler language.")} disabled={isBusy}>
+                              Explain Simpler
                             </button>
-                            <button type="button" role="menuitem" onClick={() => regenerateWithLength("standard")} disabled={isBusy}>
-                              Make standard
+                            <button type="button" role="menuitem" onClick={() => sendResponseFollowUp("Expand your previous answer with more detail.")} disabled={isBusy}>
+                              Go Deeper
                             </button>
-                            <button type="button" role="menuitem" onClick={() => regenerateWithLength("detailed")} disabled={isBusy}>
-                              Make detailed
+                            <button type="button" role="menuitem" onClick={() => sendResponseFollowUp("Rewrite your previous answer in a more natural human tone.")} disabled={isBusy}>
+                              More Human
+                            </button>
+                            <button type="button" role="menuitem" onClick={() => sendResponseFollowUp("Rewrite your previous answer in a professional style.")} disabled={isBusy}>
+                              More Professional
                             </button>
                           </>
                         )}
@@ -4739,7 +4770,12 @@ function App() {
           {loading && (
             <div className="bubble-row ai-row">
               <div className="bubble ai-bubble thinking">
-                {isCodeWorkspace ? "Code Studio is thinking..." : "FebGuy is thinking..."}
+                <span>{isCodeWorkspace ? "Code Studio is thinking..." : "FebGuy is thinking..."}</span>
+                <span className="thinking-dots" aria-hidden="true">
+                  <i />
+                  <i />
+                  <i />
+                </span>
               </div>
             </div>
           )}
