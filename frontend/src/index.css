@@ -5951,6 +5951,383 @@ label {
   box-shadow: 0 22px 60px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(45, 212, 191, 0.08) inset;
 }
 
+.input-dock.febguy-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(820px, 100%);
+  padding: 9px;
+  border-radius: 30px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(28, 31, 36, 0.94);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(255, 255, 255, 0.025) inset;
+  backdrop-filter: blur(20px);
+}
+
+.input-dock.febguy-composer.code-input {
+  display: flex;
+}
+
+.input-dock.febguy-composer input[type="file"] {
+  display: none;
+}
+
+.composer-main-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.composer-upload-wrap,
+.composer-model-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.input-dock.febguy-composer textarea {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  max-height: 180px;
+  padding: 10px 4px 9px;
+  border: 0;
+  border-radius: 0;
+  outline: 0;
+  resize: none;
+  background: transparent;
+  color: #f4f4f5;
+  font-size: 15px;
+  line-height: 1.5;
+  box-shadow: none;
+}
+
+.input-dock.febguy-composer textarea::placeholder {
+  color: rgba(212, 212, 216, 0.55);
+}
+
+.composer-plus-button,
+.composer-icon-button,
+.composer-model-button {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: rgba(244, 244, 245, 0.76);
+  transition: background 140ms ease, color 140ms ease, transform 140ms ease, opacity 140ms ease;
+}
+
+.composer-plus-button,
+.composer-icon-button {
+  display: inline-grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  padding: 0;
+  border-radius: 999px;
+}
+
+.composer-plus-button {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.composer-plus-button:hover,
+.composer-icon-button:hover,
+.composer-model-button:hover {
+  transform: translateY(-1px);
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+}
+
+.composer-plus-button:disabled,
+.composer-icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+}
+
+.composer-plus-button svg,
+.composer-icon-button svg,
+.composer-model-button svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 2;
+}
+
+.composer-upload-menu,
+.composer-model-menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  z-index: 40;
+  min-width: 218px;
+  padding: 6px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 18px;
+  background: rgba(35, 38, 45, 0.98);
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.48);
+  animation: composer-menu-rise 140ms ease-out;
+}
+
+.composer-upload-menu {
+  left: 0;
+}
+
+.composer-model-menu {
+  right: 0;
+}
+
+.composer-upload-menu button,
+.composer-model-menu button {
+  width: 100%;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 0;
+  border-radius: 13px;
+  background: transparent;
+  color: rgba(244, 244, 245, 0.9);
+  text-align: left;
+}
+
+.composer-upload-menu button:hover,
+.composer-model-menu button:hover,
+.composer-model-menu button.active {
+  background: rgba(255, 255, 255, 0.09);
+  color: #ffffff;
+  transform: none;
+}
+
+.composer-upload-menu small {
+  display: block;
+  margin-top: 2px;
+  color: rgba(212, 212, 216, 0.62);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.configure-model-action {
+  margin-top: 7px;
+  padding-top: 12px !important;
+  border-top: 1px solid rgba(148, 163, 184, 0.12) !important;
+  border-radius: 0 0 12px 12px !important;
+}
+
+.composer-file-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  padding: 0 3px 2px 42px;
+}
+
+.composer-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: min(320px, 100%);
+  padding: 6px 8px;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.06);
+  color: rgba(244, 244, 245, 0.88);
+  font-size: 12px;
+}
+
+.composer-file-chip > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-file-chip img {
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  object-fit: cover;
+}
+
+.composer-file-chip svg {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: rgba(244, 244, 245, 0.72);
+}
+
+.composer-file-chip button {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  min-width: 20px;
+  min-height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: rgba(244, 244, 245, 0.58);
+}
+
+.composer-file-chip button:hover {
+  background: rgba(248, 113, 113, 0.16);
+  color: #fecaca;
+  transform: none;
+}
+
+.composer-right-controls {
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-left: auto;
+  padding-bottom: 4px;
+}
+
+.composer-model-button {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  color: rgba(244, 244, 245, 0.72);
+}
+
+.composer-model-caret {
+  display: inline-block;
+  color: rgba(244, 244, 245, 0.48);
+  font-size: 10px;
+  line-height: 1;
+  transform: translateY(-1px) scaleX(1.15);
+}
+
+.input-dock.febguy-composer .send-action {
+  background: #f4f4f5;
+  color: #020617;
+  box-shadow: none;
+}
+
+.input-dock.febguy-composer .send-action:hover {
+  background: #ffffff;
+  color: #020617;
+}
+
+.input-dock.febguy-composer .stop-action {
+  background: #f4f4f5;
+  color: #020617;
+}
+
+.input-dock.febguy-composer .voice-action {
+  background: transparent;
+  color: rgba(244, 244, 245, 0.7);
+}
+
+.composer-config-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(2, 6, 23, 0.58);
+  backdrop-filter: blur(12px);
+}
+
+.composer-config-modal {
+  width: min(500px, 100%);
+  display: grid;
+  gap: 18px;
+  padding: 20px;
+  border: 1px solid rgba(148, 163, 184, 0.15);
+  border-radius: 24px;
+  background: rgba(24, 27, 33, 0.98);
+  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.48);
+}
+
+.composer-config-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.composer-config-header span {
+  color: rgba(244, 244, 245, 0.58);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.composer-config-header h2 {
+  margin: 4px 0 0;
+  font-size: 22px;
+}
+
+.composer-config-header button {
+  display: inline-grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+  color: rgba(244, 244, 245, 0.82);
+}
+
+.composer-config-modal section {
+  display: grid;
+  gap: 10px;
+}
+
+.composer-config-modal h3 {
+  margin: 0;
+  color: rgba(244, 244, 245, 0.72);
+  font-size: 13px;
+}
+
+.composer-config-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.composer-config-options button {
+  min-height: 42px;
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.045);
+  color: rgba(244, 244, 245, 0.86);
+  font-weight: 700;
+}
+
+.composer-config-options button.active,
+.composer-config-options button:hover {
+  border-color: rgba(244, 244, 245, 0.22);
+  background: rgba(255, 255, 255, 0.1);
+  color: #ffffff;
+}
+
+.response-style-options {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@keyframes composer-menu-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 @keyframes febguy-thinking-dot {
   0%,
   80%,
@@ -6014,6 +6391,49 @@ label {
   .input-dock {
     grid-template-columns: 1fr;
     padding: 10px;
+  }
+
+  .input-dock.febguy-composer {
+    width: 100%;
+    gap: 7px;
+    padding: 8px;
+    border-radius: 24px;
+  }
+
+  .composer-main-row {
+    align-items: flex-end;
+    gap: 6px;
+  }
+
+  .composer-right-controls {
+    width: auto;
+    justify-content: flex-end;
+    flex-wrap: nowrap;
+    gap: 2px;
+  }
+
+  .composer-model-button {
+    padding-inline: 7px;
+    font-size: 12px;
+  }
+
+  .composer-file-chip-row {
+    padding-left: 0;
+  }
+
+  .composer-model-menu,
+  .composer-upload-menu {
+    position: fixed;
+    left: 14px;
+    right: 14px;
+    bottom: 92px;
+    width: auto;
+    min-width: 0;
+  }
+
+  .composer-config-options,
+  .response-style-options {
+    grid-template-columns: 1fr;
   }
 
   .input-dock textarea {

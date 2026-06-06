@@ -24,8 +24,9 @@ import {
   Plus as PlusIcon,
   RotateCcw as RegenerateIcon,
   Search as SearchIcon,
-  SendHorizontal as SendIcon,
+  ArrowUp as SendIcon,
   Settings2 as SettingsIcon,
+  SlidersHorizontal as TuneIcon,
   Square as StopIcon,
   ThumbsDown as NotHelpfulIcon,
   ThumbsUp as HelpfulIcon,
@@ -51,16 +52,17 @@ const META_PREFIX = "\n\n[[FEBGUY_META:";
 const META_SUFFIX = "]]";
 const answerLengthOptions = ["short", "standard", "detailed"];
 const modelModeOptions = [
-  { value: "fast", label: "Fast" },
-  { value: "smart", label: "Smart" },
-  { value: "deep", label: "Deep" }
+  { value: "fast", label: "Fast", icon: "\u26a1" },
+  { value: "smart", label: "Smart", icon: "\ud83e\udde0" },
+  { value: "deep", label: "Deep", icon: "\ud83d\udd2c" }
 ];
 const responseModeOptions = [
   { value: "balanced", label: "Balanced" },
-  { value: "deep", label: "Deep" },
-  { value: "creative", label: "Creative" },
   { value: "teacher", label: "Teacher" },
-  { value: "human", label: "Human" }
+  { value: "creative", label: "Creative" },
+  { value: "human", label: "Human" },
+  { value: "coding", label: "Coding" },
+  { value: "deep", label: "Deep" },
 ];
 const hiddenSuggestions = new Set([
   "Explain this more simply",
@@ -489,6 +491,9 @@ function App() {
   const [messageActionMenuKey, setMessageActionMenuKey] = useState("");
   const [sourcesDrawer, setSourcesDrawer] = useState(null);
   const [documentsDrawer, setDocumentsDrawer] = useState(null);
+  const [composerModelMenuOpen, setComposerModelMenuOpen] = useState(false);
+  const [composerConfigOpen, setComposerConfigOpen] = useState(false);
+  const [composerUploadMenuOpen, setComposerUploadMenuOpen] = useState(false);
 
   const [settings, setSettings] = useState(defaultSettings);
   const [health, setHealth] = useState(null);
@@ -4215,6 +4220,8 @@ function App() {
   ];
   const isAccountProfile = sessionMode === "profile" && Boolean(profile?.device_bound);
   const selectedProfile = profiles.find(item => item.id === selectedProfileId) || profiles[0] || null;
+  const selectedModelMode = modelModeOptions.find(option => option.value === modelMode) || modelModeOptions[1];
+  const selectedResponseMode = responseModeOptions.find(option => option.value === responseMode) || responseModeOptions[0];
 
   if (bootstrapping) {
     return renderLoadingScreen();
@@ -4789,76 +4796,6 @@ function App() {
           <div ref={messagesEndRef} />
         </section>
 
-        {selectedFile && !isCodeWorkspace && (
-          <div className="selected-file">
-            <div className="selected-file-preview">
-              {filePreview ? (
-                <img src={filePreview} alt="Selected preview" />
-              ) : (
-                <span>{selectedFile.name}</span>
-              )}
-            </div>
-
-            <button type="button" onClick={resetFileInput} title="Remove file" aria-label="Remove file">
-              <CloseIcon />
-            </button>
-          </div>
-        )}
-
-        {isCodeWorkspace && selectedCodeFiles.length > 0 && (
-          <div className="selected-code-files">
-            <div>
-              <CodeFileIcon />
-              <span>
-                <strong>{selectedCodeFiles.length} code file{selectedCodeFiles.length === 1 ? "" : "s"} ready</strong>
-                <small>These will be added only to this Code Studio chat.</small>
-              </span>
-            </div>
-            <div className="selected-code-file-list">
-              {selectedCodeFiles.map(fileItem => (
-                <span key={`${fileItem.name}-${fileItem.size}`}>{fileItem.name}</span>
-              ))}
-            </div>
-            <button type="button" onClick={resetFileInput} title="Remove code files" aria-label="Remove code files">
-              <CloseIcon />
-            </button>
-          </div>
-        )}
-
-        {!isCodeWorkspace && (
-          <div className="ai-control-strip" aria-label="AI response controls">
-            <div className="ai-control-group" aria-label="Model quality">
-              <span className="ai-control-label">Quality</span>
-              <div className="ai-chip-row">
-                {modelModeOptions.map(option => (
-                  <button
-                    key={option.value}
-                    type="button"
-                    className={`ai-mode-chip ${modelMode === option.value ? "active" : ""}`}
-                    onClick={() => setModelModePreference(option.value)}
-                    aria-pressed={modelMode === option.value}
-                  >
-                    {option.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <label className="ai-control-group ai-style-control">
-              <span className="ai-control-label">Style</span>
-              <select
-                value={responseMode}
-                onChange={(event) => setResponseModePreference(event.target.value)}
-                aria-label="Response style"
-              >
-                {responseModeOptions.map(option => (
-                  <option key={option.value} value={option.value}>{option.label}</option>
-                ))}
-              </select>
-            </label>
-          </div>
-        )}
-
         {showGuestLimitUi && (
           <div className="guest-limit-strip" aria-label="Guest usage remaining">
             {guestLimitItems.map(item => {
@@ -4888,87 +4825,226 @@ function App() {
         )}
 
         <form
-          className={`input-dock ${isCodeWorkspace ? "code-input" : ""}`}
+          className={`input-dock febguy-composer ${isCodeWorkspace ? "code-input" : ""}`}
           onSubmit={(event) => {
             event.preventDefault();
+            setComposerModelMenuOpen(false);
+            setComposerUploadMenuOpen(false);
             sendMessage();
           }}
         >
-          <textarea
-            ref={composerRef}
-            placeholder={isCodeWorkspace ? "Ask Code Studio to write, debug, explain, convert, or optimize code..." : "Ask FebGuy anything..."}
-            value={message}
-            rows={1}
-            onChange={(event) => setMessage(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                sendMessage();
-              }
-            }}
-          />
-
-          {showStopControl ? (
-            <button type="button" className="stop-action" onClick={stopGenerating}>
-              <StopIcon />
-              Stop
-            </button>
-          ) : (
-            <button type="submit" className="send-action">
-              <SendIcon />
-              Send
-            </button>
-          )}
-          {!isCodeWorkspace && (
-            <button type="button" className="voice-action" onClick={openVoiceMode} disabled={isBusy}>
-              <SpeakerIcon />
-              Voice
-            </button>
-          )}
-
           {isCodeWorkspace ? (
-            <>
-              <input
-                ref={fileInputRef}
-                id="codeFileUpload"
-                type="file"
-                multiple
-                accept={CODE_FILE_ACCEPT}
-                onChange={handleFileSelect}
-              />
-
-              <button
-                type="button"
-                className="attach-action code-attach-action"
-                onClick={() => fileInputRef.current?.click()}
-                disabled={isBusy}
-              >
-                <CodeFileIcon />
-                Files
-              </button>
-            </>
+            <input
+              ref={fileInputRef}
+              id="codeFileUpload"
+              type="file"
+              multiple
+              accept={CODE_FILE_ACCEPT}
+              onChange={handleFileSelect}
+            />
           ) : (
-            <>
-              <input
-                ref={fileInputRef}
-                id="fileUpload"
-                type="file"
-                accept=".pdf,.docx,.png,.jpg,.jpeg,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,text/plain"
-                onChange={handleFileSelect}
-              />
+            <input
+              ref={fileInputRef}
+              id="fileUpload"
+              type="file"
+              accept=".pdf,.docx,.png,.jpg,.jpeg,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,image/png,image/jpeg,text/plain"
+              onChange={handleFileSelect}
+            />
+          )}
 
+          {((selectedFile && !isCodeWorkspace) || (isCodeWorkspace && selectedCodeFiles.length > 0)) && (
+            <div className="composer-file-chip-row">
+              {selectedFile && !isCodeWorkspace && (
+                <span className="composer-file-chip">
+                  {filePreview ? <img src={filePreview} alt="" /> : <AttachIcon />}
+                  <span>{selectedFile.name}</span>
+                  <button type="button" onClick={resetFileInput} aria-label="Remove file">
+                    <CloseIcon />
+                  </button>
+                </span>
+              )}
+
+              {isCodeWorkspace && selectedCodeFiles.map(fileItem => (
+                <span className="composer-file-chip" key={`${fileItem.name}-${fileItem.size}`}>
+                  <CodeFileIcon />
+                  <span>{fileItem.name}</span>
+                  <button type="button" onClick={resetFileInput} aria-label="Remove code files">
+                    <CloseIcon />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+
+          <div className="composer-main-row">
+            <div className="composer-upload-wrap">
               <button
                 type="button"
-                className="attach-action"
-                onClick={() => fileInputRef.current?.click()}
+                className="composer-plus-button"
+                onClick={() => setComposerUploadMenuOpen(open => !open)}
                 disabled={isBusy}
+                aria-label="Open upload menu"
+                aria-expanded={composerUploadMenuOpen}
               >
-                <AttachIcon />
-                Attach
+                <PlusIcon />
               </button>
-            </>
-          )}
+
+              {composerUploadMenuOpen && (
+                <div className="composer-upload-menu" role="menu">
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setComposerUploadMenuOpen(false);
+                      fileInputRef.current?.click();
+                    }}
+                  >
+                    {isCodeWorkspace ? <CodeFileIcon /> : <AttachIcon />}
+                    <span>
+                      <strong>{isCodeWorkspace ? "Attach code files" : "Upload a file"}</strong>
+                      <small>{isCodeWorkspace ? "Add project context to this chat" : "PDF, DOCX, image, or TXT"}</small>
+                    </span>
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <textarea
+              ref={composerRef}
+              placeholder={isCodeWorkspace ? "Ask Code Studio to write, debug, explain, convert, or optimize code..." : "Ask FebGuy anything..."}
+              value={message}
+              rows={1}
+              onChange={(event) => setMessage(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  setComposerModelMenuOpen(false);
+                  setComposerUploadMenuOpen(false);
+                  sendMessage();
+                }
+              }}
+            />
+
+            <div className="composer-right-controls">
+              {!isCodeWorkspace && (
+                <div className="composer-model-wrap">
+                  <button
+                    type="button"
+                    className="composer-model-button"
+                    onClick={() => setComposerModelMenuOpen(open => !open)}
+                    aria-label="Choose model quality"
+                    aria-expanded={composerModelMenuOpen}
+                  >
+                    <span className="composer-model-label">{selectedModelMode.label}</span>
+                    <span className="composer-model-caret" aria-hidden="true">v</span>
+                  </button>
+
+                  {composerModelMenuOpen && (
+                    <div className="composer-model-menu" role="menu">
+                      {modelModeOptions.map(option => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          role="menuitemradio"
+                          aria-checked={modelMode === option.value}
+                          className={modelMode === option.value ? "active" : ""}
+                          onClick={() => {
+                            setModelModePreference(option.value);
+                            setComposerModelMenuOpen(false);
+                          }}
+                        >
+                          <strong>{option.label}</strong>
+                        </button>
+                      ))}
+                      <button
+                        type="button"
+                        className="configure-model-action"
+                        onClick={() => {
+                          setComposerModelMenuOpen(false);
+                          setComposerConfigOpen(true);
+                        }}
+                      >
+                        <TuneIcon />
+                        <span>Configure...</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {!isCodeWorkspace && (
+                <button
+                  type="button"
+                  className="composer-icon-button voice-action"
+                  onClick={openVoiceMode}
+                  disabled={isBusy}
+                  aria-label="Open voice mode"
+                >
+                  <Mic />
+                </button>
+              )}
+
+              {showStopControl ? (
+                <button type="button" className="composer-icon-button stop-action" onClick={stopGenerating} aria-label="Stop response">
+                  <StopIcon />
+                </button>
+              ) : (
+                <button type="submit" className="composer-icon-button send-action" aria-label="Send message">
+                  <SendIcon />
+                </button>
+              )}
+            </div>
+          </div>
         </form>
+
+        {composerConfigOpen && (
+          <div className="composer-config-overlay" role="presentation">
+            <div className="composer-config-modal" role="dialog" aria-modal="true" aria-labelledby="composer-config-title">
+              <div className="composer-config-header">
+                <div>
+                  <span>Composer</span>
+                  <h2 id="composer-config-title">Response controls</h2>
+                </div>
+                <button type="button" onClick={() => setComposerConfigOpen(false)} aria-label="Close composer settings">
+                  <CloseIcon />
+                </button>
+              </div>
+
+              <section>
+                <h3>Model selection</h3>
+                <div className="composer-config-options">
+                  {modelModeOptions.map(option => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={modelMode === option.value ? "active" : ""}
+                      onClick={() => setModelModePreference(option.value)}
+                    >
+                      <span>{option.icon}</span>
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+
+              <section>
+                <h3>Response style</h3>
+                <div className="composer-config-options response-style-options">
+                  {responseModeOptions.map(option => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={responseMode === option.value ? "active" : ""}
+                      onClick={() => setResponseModePreference(option.value)}
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              </section>
+            </div>
+          </div>
+        )}
       </main>
 
       {renderPanel()}
