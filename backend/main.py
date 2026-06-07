@@ -85,7 +85,11 @@ try:
     POSTGRES_CONNECT_TIMEOUT = max(1, int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5") or "5"))
 except ValueError:
     POSTGRES_CONNECT_TIMEOUT = 5
-DATABASE_PROVIDER = os.getenv("FEBGUY_DATABASE_PROVIDER", "sqlite").strip().lower() or "sqlite"
+DATABASE_PROVIDER = (
+    os.getenv("DATABASE_PROVIDER")
+    or os.getenv("FEBGUY_DATABASE_PROVIDER")
+    or "sqlite"
+).strip().lower() or "sqlite"
 
 API_PUBLIC_BASE_URL = os.getenv("API_PUBLIC_BASE_URL", "http://127.0.0.1:8000")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
@@ -366,6 +370,7 @@ if not logging.getLogger().handlers:
     )
 
 DATA_LOCK = threading.RLock()
+DATABASE_INITIALIZED = False
 
 DATABASE = DatabaseService(
     DatabaseSettings(
@@ -807,8 +812,8 @@ def decode_json(raw: str | None, default: Any) -> Any:
         return default
 
 
-def db_connect() -> sqlite3.Connection:
-    return DATABASE.sqlite_connect()
+def db_connect() -> Any:
+    return DATABASE.connect()
 
 
 def postgres_connect():
@@ -827,8 +832,37 @@ def database_health_status() -> dict[str, Any]:
     return DATABASE.safe_health()
 
 
+def init_postgres_database() -> None:
+    schema_path = BASE_DIR / "supabase_schema.sql"
+    if not schema_path.exists():
+        raise RuntimeError("Supabase/Postgres schema file is missing.")
+
+    with db_connect() as conn:
+        conn.executescript(schema_path.read_text(encoding="utf-8"))
+        conn.execute(
+            """
+            INSERT INTO meta(key, value)
+            VALUES('schema_initialized_at', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (now_iso(),),
+        )
+
+
 def init_database() -> None:
+    global DATABASE_INITIALIZED
+    if DATABASE_INITIALIZED:
+        return
+
     with DATA_LOCK:
+        if DATABASE_INITIALIZED:
+            return
+
+        if DATABASE.is_postgres_active():
+            init_postgres_database()
+            DATABASE_INITIALIZED = True
+            return
+
         with db_connect() as conn:
             conn.executescript(
                 """
@@ -1313,7 +1347,11 @@ def init_database() -> None:
                         """
                     )
                 conn.execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES('ownership_v1_migrated', ?)",
+                    """
+                    INSERT INTO meta(key, value)
+                    VALUES('ownership_v1_migrated', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
                     (now_iso(),),
                 )
 
@@ -1364,9 +1402,14 @@ def init_database() -> None:
             if not migrated:
                 migrate_json_to_sqlite(conn)
                 conn.execute(
-                    "INSERT OR REPLACE INTO meta(key, value) VALUES('json_migrated', ?)",
+                    """
+                    INSERT INTO meta(key, value)
+                    VALUES('json_migrated', ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
                     (now_iso(),),
                 )
+        DATABASE_INITIALIZED = True
 
 
 def upsert_profile_row(conn: sqlite3.Connection, profile: dict[str, Any]) -> None:
@@ -1566,11 +1609,24 @@ def upsert_settings_row(
     merged = settings_to_db(settings or DEFAULT_SETTINGS)
     conn.execute(
         """
-        INSERT OR REPLACE INTO settings
+        INSERT INTO settings
             (profile_id, user_id, guest_id, device_id, voice_enabled, sentence_voice,
              search_enabled, rag_enabled, voice_name, voice_speed, last_spoken_response,
              theme, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(profile_id) DO UPDATE SET
+            user_id = excluded.user_id,
+            guest_id = excluded.guest_id,
+            device_id = excluded.device_id,
+            voice_enabled = excluded.voice_enabled,
+            sentence_voice = excluded.sentence_voice,
+            search_enabled = excluded.search_enabled,
+            rag_enabled = excluded.rag_enabled,
+            voice_name = excluded.voice_name,
+            voice_speed = excluded.voice_speed,
+            last_spoken_response = excluded.last_spoken_response,
+            theme = excluded.theme,
+            updated_at = excluded.updated_at
         """,
         (
             profile_id,
@@ -1614,9 +1670,16 @@ def upsert_memory_rows(
     normalized = normalize_memory(memory or {})
     conn.execute(
         """
-        INSERT OR REPLACE INTO memories
+        INSERT INTO memories
             (profile_id, user_id, guest_id, device_id, name, role, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(profile_id) DO UPDATE SET
+            user_id = excluded.user_id,
+            guest_id = excluded.guest_id,
+            device_id = excluded.device_id,
+            name = excluded.name,
+            role = excluded.role,
+            updated_at = excluded.updated_at
         """,
         (profile_id, *owner_values(scope), normalized["name"], normalized["role"], now_iso()),
     )
@@ -1693,10 +1756,21 @@ def upsert_chat_row(
     reject_other_owner_id(conn, "chats", chat_item["id"], scope, "chat")
     conn.execute(
         """
-        INSERT OR REPLACE INTO chats
+        INSERT INTO chats
             (id, profile_id, user_id, guest_id, device_id, title, summary,
              last_uploaded_file, pinned, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            profile_id = excluded.profile_id,
+            user_id = excluded.user_id,
+            guest_id = excluded.guest_id,
+            device_id = excluded.device_id,
+            title = excluded.title,
+            summary = excluded.summary,
+            last_uploaded_file = excluded.last_uploaded_file,
+            pinned = excluded.pinned,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at
         """,
         (
             chat_item["id"],
@@ -1787,10 +1861,20 @@ def upsert_code_chat_row(
     reject_other_owner_id(conn, "code_chats", chat_item["id"], scope, "code chat")
     conn.execute(
         """
-        INSERT OR REPLACE INTO code_chats
+        INSERT INTO code_chats
             (id, profile_id, user_id, guest_id, device_id, title, summary,
              pinned, created_at, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            profile_id = excluded.profile_id,
+            user_id = excluded.user_id,
+            guest_id = excluded.guest_id,
+            device_id = excluded.device_id,
+            title = excluded.title,
+            summary = excluded.summary,
+            pinned = excluded.pinned,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at
         """,
         (
             chat_item["id"],
@@ -1898,10 +1982,20 @@ def upsert_file_row(
     created_at = existing["created_at"] if existing else now_iso()
     conn.execute(
         """
-        INSERT OR REPLACE INTO files
+        INSERT INTO files
             (id, profile_id, user_id, guest_id, device_id, file_name,
              file_type, path, document_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            profile_id = excluded.profile_id,
+            user_id = excluded.user_id,
+            guest_id = excluded.guest_id,
+            device_id = excluded.device_id,
+            file_name = excluded.file_name,
+            file_type = excluded.file_type,
+            path = excluded.path,
+            document_id = excluded.document_id,
+            created_at = excluded.created_at
         """,
         (
             file_id,
@@ -1992,11 +2086,27 @@ def save_document_record(
             reject_other_owner_id(conn, "documents", document_id, scope, "document")
             conn.execute(
                 """
-                INSERT OR REPLACE INTO documents
+                INSERT INTO documents
                     (id, profile_id, user_id, guest_id, device_id, chat_id,
                      file_name, file_type, path, context, raw_text, chunks,
                      is_image, used_ocr, page_count, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    user_id = excluded.user_id,
+                    guest_id = excluded.guest_id,
+                    device_id = excluded.device_id,
+                    chat_id = excluded.chat_id,
+                    file_name = excluded.file_name,
+                    file_type = excluded.file_type,
+                    path = excluded.path,
+                    context = excluded.context,
+                    raw_text = excluded.raw_text,
+                    chunks = excluded.chunks,
+                    is_image = excluded.is_image,
+                    used_ocr = excluded.used_ocr,
+                    page_count = excluded.page_count,
+                    created_at = excluded.created_at
                 """,
                 (
                     document_id,
@@ -2108,9 +2218,13 @@ def migrate_json_to_sqlite(conn: sqlite3.Connection) -> None:
                 continue
             conn.execute(
                 """
-                INSERT OR REPLACE INTO sessions
+                INSERT INTO sessions
                     (token, profile_id, created_at, last_seen_at)
                 VALUES (?, ?, ?, ?)
+                ON CONFLICT(token) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    created_at = excluded.created_at,
+                    last_seen_at = excluded.last_seen_at
                 """,
                 (
                     token,
@@ -3603,11 +3717,24 @@ def save_code_project_file(
             created_at = existing["created_at"] if existing else timestamp
             conn.execute(
                 """
-                INSERT OR REPLACE INTO code_project_files
+                INSERT INTO code_project_files
                     (id, profile_id, user_id, guest_id, device_id, chat_id,
                      file_name, file_type, language, content, size_bytes,
                      created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    user_id = excluded.user_id,
+                    guest_id = excluded.guest_id,
+                    device_id = excluded.device_id,
+                    chat_id = excluded.chat_id,
+                    file_name = excluded.file_name,
+                    file_type = excluded.file_type,
+                    language = excluded.language,
+                    content = excluded.content,
+                    size_bytes = excluded.size_bytes,
+                    created_at = excluded.created_at,
+                    updated_at = excluded.updated_at
                 """,
                 (
                     file_id,
@@ -8489,6 +8616,11 @@ def transcribe_audio_with_groq(
 
 
 def create_database_backup(reason: str = "manual") -> dict[str, Any]:
+    if not DATABASE.is_sqlite_active():
+        raise HTTPException(
+            status_code=400,
+            detail="Database backups are only available when DATABASE_PROVIDER=sqlite.",
+        )
     backup_dir = DATA_DIR / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup_path = backup_dir / f"febguy-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{reason}.db"
