@@ -2861,7 +2861,7 @@ def create_or_update_account_user(identity: dict[str, str]) -> dict[str, Any]:
                 )
                 user_id = row["id"]
             else:
-                user_id = str(uuid.uuid4())
+                user_id = identity["auth_user_id"]
                 workspace_profile_id = str(uuid.uuid4())
                 upsert_profile_row(
                     conn,

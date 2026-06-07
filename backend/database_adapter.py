@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import uuid as uuid_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
@@ -170,8 +171,14 @@ class DatabaseService:
 class CompatRow(Mapping[str, Any]):
     def __init__(self, columns: Iterable[str], values: Iterable[Any]):
         self._columns = list(columns)
-        self._values = tuple(values)
+        self._values = tuple(self._normalize_value(value) for value in values)
         self._index = {column: index for index, column in enumerate(self._columns)}
+
+    @staticmethod
+    def _normalize_value(value: Any) -> Any:
+        if isinstance(value, uuid_module.UUID):
+            return str(value)
+        return value
 
     def __getitem__(self, key: str | int) -> Any:
         if isinstance(key, int):
