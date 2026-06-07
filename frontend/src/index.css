@@ -250,7 +250,7 @@ label {
 .selected-file button,
 .voice-close,
 .voice-controls button,
-.input-dock button,
+.input-dock:not(.febguy-composer) button,
 .panel-header button,
 .memory-item button {
   border: 0;
@@ -1617,16 +1617,16 @@ label {
   padding: 10px;
 }
 
-.input-dock.code-input {
+.input-dock.code-input:not(.febguy-composer) {
   grid-template-columns: minmax(0, 1fr) auto;
 }
 
-.input-dock:focus-within {
+.input-dock:not(.febguy-composer):focus-within {
   border-color: rgba(20, 184, 166, 0.44);
   box-shadow: 0 22px 76px rgba(0, 0, 0, 0.34), var(--ring);
 }
 
-.input-dock textarea {
+.input-dock:not(.febguy-composer) textarea {
   min-width: 0;
   min-height: 44px;
   max-height: 120px;
@@ -1635,11 +1635,11 @@ label {
   background: rgba(5, 9, 18, 0.64);
 }
 
-.input-dock textarea::placeholder {
+.input-dock:not(.febguy-composer) textarea::placeholder {
   color: #718096;
 }
 
-.input-dock button {
+.input-dock:not(.febguy-composer) button {
   min-height: 44px;
   padding: 0 14px;
   display: flex;
@@ -1651,28 +1651,28 @@ label {
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.18);
 }
 
-.input-dock button:hover {
+.input-dock:not(.febguy-composer) button:hover {
   transform: translateY(-1px);
 }
 
-.input-dock button svg {
+.input-dock:not(.febguy-composer) button svg {
   width: 16px;
   height: 16px;
 }
 
-.input-dock button:nth-of-type(2) {
+.input-dock:not(.febguy-composer) button:nth-of-type(2) {
   background: rgba(99, 102, 241, 0.24);
   color: #c7d2fe;
   border: 1px solid rgba(99, 102, 241, 0.36);
 }
 
-.input-dock button:nth-of-type(3) {
+.input-dock:not(.febguy-composer) button:nth-of-type(3) {
   background: rgba(245, 158, 11, 0.18);
   color: #fde68a;
   border: 1px solid rgba(245, 158, 11, 0.3);
 }
 
-.input-dock input[type="file"] {
+.input-dock:not(.febguy-composer) input[type="file"] {
   display: none;
 }
 
@@ -2390,16 +2390,16 @@ label {
     padding: 8px;
   }
 
-  .input-dock.code-input {
+  .input-dock.code-input:not(.febguy-composer) {
     grid-template-columns: 1fr;
   }
 
-  .input-dock textarea {
+  .input-dock:not(.febguy-composer) textarea {
     grid-column: 1 / -1;
     min-height: 42px;
   }
 
-  .input-dock button {
+  .input-dock:not(.febguy-composer) button {
     min-height: 40px;
     padding: 0 8px;
     font-size: 13px;
@@ -3693,31 +3693,31 @@ label {
   flex-shrink: 0;
 }
 
-.input-dock textarea {
+.input-dock:not(.febguy-composer) textarea {
   min-height: 50px;
   padding: 15px 16px;
   background: rgba(4, 9, 17, 0.55);
 }
 
-.input-dock button {
+.input-dock:not(.febguy-composer) button {
   min-height: 50px;
   border: 1px solid transparent;
   padding: 0 16px;
   font-weight: 700;
 }
 
-.input-dock .send-action {
+.input-dock:not(.febguy-composer) .send-action {
   background: linear-gradient(135deg, #24c7b6, #14a998);
   box-shadow: 0 12px 25px rgba(20, 184, 166, 0.2);
 }
 
-.input-dock .voice-action {
+.input-dock:not(.febguy-composer) .voice-action {
   border-color: rgba(99, 102, 241, 0.32);
   background: rgba(99, 102, 241, 0.15);
   color: #d5d8ff;
 }
 
-.input-dock .attach-action {
+.input-dock:not(.febguy-composer) .attach-action {
   border-color: rgba(245, 158, 11, 0.27);
   background: rgba(245, 158, 11, 0.12);
   color: #f8d38b;
@@ -3958,15 +3958,15 @@ label {
     grid-template-columns: repeat(3, 1fr);
   }
 
-  .input-dock textarea {
+  .input-dock:not(.febguy-composer) textarea {
     grid-column: 1 / -1;
   }
 
-  .input-dock button {
+  .input-dock:not(.febguy-composer) button {
     padding: 0 9px;
   }
 
-  .input-dock.code-input {
+  .input-dock.code-input:not(.febguy-composer) {
     grid-template-columns: 1fr;
   }
 
@@ -4214,22 +4214,22 @@ label {
   color: var(--text);
 }
 
-.input-dock .stop-action {
+.input-dock:not(.febguy-composer) .stop-action {
   border-color: rgba(248, 113, 113, 0.26);
   background: rgba(239, 68, 68, 0.12);
   color: #fecaca;
   box-shadow: none;
 }
 
-.input-dock .stop-action:hover {
+.input-dock:not(.febguy-composer) .stop-action:hover {
   background: rgba(239, 68, 68, 0.18);
 }
 
-.input-dock.code-input {
+.input-dock.code-input:not(.febguy-composer) {
   grid-template-columns: minmax(0, 1fr) auto auto;
 }
 
-.input-dock .code-attach-action {
+.input-dock:not(.febguy-composer) .code-attach-action {
   border-color: rgba(45, 212, 191, 0.26);
   background: rgba(20, 184, 166, 0.12);
   color: #a7fff4;
@@ -4408,7 +4408,7 @@ label {
 }
 
 @media (max-width: 760px) {
-  .input-dock.code-input {
+  .input-dock.code-input:not(.febguy-composer) {
     grid-template-columns: 1fr;
   }
 
@@ -4890,7 +4890,7 @@ label {
 .guest-actions button,
 .primary-action,
 .primary-dialog-action,
-.input-dock .send-action {
+.input-dock:not(.febguy-composer) .send-action {
   background: linear-gradient(135deg, #22d3ee, var(--premium-accent));
   color: #040914;
   box-shadow: 0 18px 44px rgba(34, 211, 238, 0.18), 0 12px 34px rgba(108, 99, 255, 0.16);
@@ -5023,31 +5023,31 @@ label {
   outline: none;
 }
 
-.input-dock:focus-within {
+.input-dock:not(.febguy-composer):focus-within {
   border-color: rgba(108, 99, 255, 0.48);
   box-shadow: 0 30px 86px rgba(0, 0, 0, 0.38), 0 0 0 4px rgba(108, 99, 255, 0.13);
 }
 
-.input-dock textarea {
+.input-dock:not(.febguy-composer) textarea {
   border-radius: 13px;
   background: rgba(3, 7, 15, 0.68);
 }
 
-.input-dock button {
+.input-dock:not(.febguy-composer) button {
   border-radius: 13px;
   transition: transform 160ms var(--premium-ease), box-shadow 160ms ease, background 160ms ease;
 }
 
-.input-dock button:hover {
+.input-dock:not(.febguy-composer) button:hover {
   transform: translateY(-1px);
 }
 
-.input-dock .voice-action {
+.input-dock:not(.febguy-composer) .voice-action {
   background: rgba(108, 99, 255, 0.16);
   color: #dcd9ff;
 }
 
-.input-dock .attach-action {
+.input-dock:not(.febguy-composer) .attach-action {
   background: rgba(245, 158, 11, 0.13);
   color: #ffe0a1;
 }
@@ -5942,44 +5942,61 @@ label {
 }
 
 .input-dock {
-  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms var(--premium-ease);
+  transition: border-color 160ms ease, box-shadow 160ms ease;
 }
 
-.input-dock:focus-within {
+.input-dock:not(.febguy-composer):focus-within {
   transform: translateY(-1px);
   border-color: rgba(45, 212, 191, 0.48);
   box-shadow: 0 22px 60px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(45, 212, 191, 0.08) inset;
 }
 
 .input-dock.febguy-composer {
+  --composer-bg: #303030;
+  --composer-control: #3d3d3d;
+  --composer-control-hover: #474747;
+  --composer-menu: #2b2b2b;
+  --composer-line: rgba(255, 255, 255, 0.1);
+  --composer-text: #f4f4f4;
+  --composer-muted: #b4b4b4;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  width: min(820px, 100%);
-  padding: 9px;
-  border-radius: 30px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  background: rgba(28, 31, 36, 0.94);
-  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(255, 255, 255, 0.025) inset;
-  backdrop-filter: blur(20px);
+  gap: 7px;
+  width: min(800px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 10px 12px;
+  border: 1px solid var(--composer-line);
+  border-radius: 28px;
+  background: var(--composer-bg);
+  color: var(--composer-text);
+  box-shadow: none;
+  backdrop-filter: none;
 }
 
 .input-dock.febguy-composer.code-input {
   display: flex;
 }
 
+.input-dock.febguy-composer:focus-within {
+  border-color: rgba(255, 255, 255, 0.16);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
+  transform: none;
+}
+
 .input-dock.febguy-composer input[type="file"] {
   display: none;
 }
 
-.composer-main-row {
+.input-dock.febguy-composer .composer-main-row {
   display: flex;
   align-items: flex-end;
-  gap: 8px;
+  gap: 9px;
+  width: 100%;
+  min-height: 42px;
 }
 
-.composer-upload-wrap,
-.composer-model-wrap {
+.input-dock.febguy-composer .composer-upload-wrap,
+.input-dock.febguy-composer .composer-model-wrap {
   position: relative;
   flex: 0 0 auto;
 }
@@ -5988,175 +6005,183 @@ label {
   flex: 1 1 auto;
   width: 100%;
   min-width: 0;
-  min-height: 42px;
-  max-height: 180px;
-  padding: 10px 4px 9px;
+  min-height: 40px;
+  max-height: 190px;
+  padding: 8px 0 7px;
   border: 0;
   border-radius: 0;
   outline: 0;
   resize: none;
+  overflow-y: auto;
   background: transparent;
-  color: #f4f4f5;
-  font-size: 15px;
+  color: var(--composer-text);
+  font-size: 16px;
   line-height: 1.5;
   box-shadow: none;
 }
 
-.input-dock.febguy-composer textarea::placeholder {
-  color: rgba(212, 212, 216, 0.55);
+.input-dock.febguy-composer textarea:focus-visible {
+  border-color: transparent;
+  box-shadow: none;
 }
 
-.composer-plus-button,
-.composer-icon-button,
-.composer-model-button {
+.input-dock.febguy-composer textarea::placeholder {
+  color: var(--composer-muted);
+}
+
+.input-dock.febguy-composer :is(.composer-plus-button, .composer-icon-button, .composer-model-button),
+.input-dock.febguy-composer :is(.composer-upload-menu, .composer-model-menu) button,
+.composer-config-modal button {
   appearance: none;
   border: 0;
-  background: transparent;
-  color: rgba(244, 244, 245, 0.76);
-  transition: background 140ms ease, color 140ms ease, transform 140ms ease, opacity 140ms ease;
+  box-shadow: none;
+  font: inherit;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, opacity 140ms ease;
 }
 
-.composer-plus-button,
-.composer-icon-button {
+.input-dock.febguy-composer :is(.composer-plus-button, .composer-icon-button) {
   display: inline-grid;
   place-items: center;
-  width: 34px;
-  height: 34px;
-  min-width: 34px;
-  min-height: 34px;
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  min-height: 36px;
   padding: 0;
   border-radius: 999px;
+  background: transparent;
+  color: #d1d1d1;
 }
 
-.composer-plus-button {
-  background: rgba(255, 255, 255, 0.08);
+.input-dock.febguy-composer .composer-plus-button {
+  background: var(--composer-control);
 }
 
-.composer-plus-button:hover,
-.composer-icon-button:hover,
-.composer-model-button:hover {
-  transform: translateY(-1px);
-  background: rgba(255, 255, 255, 0.1);
+.input-dock.febguy-composer :is(.composer-plus-button, .composer-icon-button, .composer-model-button):hover {
+  background: var(--composer-control-hover);
   color: #ffffff;
-}
-
-.composer-plus-button:disabled,
-.composer-icon-button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
   transform: none;
 }
 
-.composer-plus-button svg,
-.composer-icon-button svg,
-.composer-model-button svg {
-  width: 16px;
-  height: 16px;
+.input-dock.febguy-composer :is(.composer-plus-button, .composer-icon-button, .composer-model-button):focus-visible,
+.composer-config-modal button:focus-visible {
+  border-color: rgba(255, 255, 255, 0.22);
+  outline: 0;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.24);
+}
+
+.input-dock.febguy-composer :is(.composer-plus-button, .composer-icon-button):disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.input-dock.febguy-composer :is(.composer-plus-button, .composer-icon-button, .composer-model-button) svg {
+  width: 18px;
+  height: 18px;
   stroke-width: 2;
 }
 
-.composer-upload-menu,
-.composer-model-menu {
+.input-dock.febguy-composer .composer-upload-menu,
+.input-dock.febguy-composer .composer-model-menu {
   position: absolute;
   bottom: calc(100% + 10px);
   z-index: 40;
-  min-width: 218px;
+  min-width: 220px;
   padding: 6px;
-  border: 1px solid rgba(148, 163, 184, 0.16);
-  border-radius: 18px;
-  background: rgba(35, 38, 45, 0.98);
-  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.48);
+  border: 1px solid var(--composer-line);
+  border-radius: 14px;
+  background: var(--composer-menu);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.34);
   animation: composer-menu-rise 140ms ease-out;
 }
 
-.composer-upload-menu {
+.input-dock.febguy-composer .composer-upload-menu {
   left: 0;
 }
 
-.composer-model-menu {
+.input-dock.febguy-composer .composer-model-menu {
   right: 0;
 }
 
-.composer-upload-menu button,
-.composer-model-menu button {
+.input-dock.febguy-composer :is(.composer-upload-menu, .composer-model-menu) button {
   width: 100%;
-  min-height: 0;
+  min-height: 36px;
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px;
-  border: 0;
-  border-radius: 13px;
+  padding: 9px 10px;
+  border-radius: 9px;
   background: transparent;
-  color: rgba(244, 244, 245, 0.9);
+  color: #eeeeee;
   text-align: left;
 }
 
-.composer-upload-menu button:hover,
-.composer-model-menu button:hover,
-.composer-model-menu button.active {
-  background: rgba(255, 255, 255, 0.09);
+.input-dock.febguy-composer :is(.composer-upload-menu, .composer-model-menu) button:hover,
+.input-dock.febguy-composer .composer-model-menu button.active {
+  background: #3a3a3a;
   color: #ffffff;
   transform: none;
 }
 
-.composer-upload-menu small {
+.input-dock.febguy-composer .composer-upload-menu small {
   display: block;
   margin-top: 2px;
-  color: rgba(212, 212, 216, 0.62);
+  color: #a8a8a8;
   font-size: 11px;
   line-height: 1.35;
 }
 
-.configure-model-action {
-  margin-top: 7px;
-  padding-top: 12px !important;
-  border-top: 1px solid rgba(148, 163, 184, 0.12) !important;
-  border-radius: 0 0 12px 12px !important;
+.input-dock.febguy-composer .configure-model-action {
+  margin-top: 5px;
+  padding-top: 10px;
+  border-top: 1px solid var(--composer-line);
+  border-radius: 0 0 8px 8px;
 }
 
-.composer-file-chip-row {
+.input-dock.febguy-composer .composer-file-chip-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 7px;
-  padding: 0 3px 2px 42px;
+  gap: 6px;
+  padding: 1px 0 0 45px;
 }
 
-.composer-file-chip {
+.input-dock.febguy-composer .composer-file-chip {
   display: inline-flex;
   align-items: center;
   gap: 7px;
   max-width: min(320px, 100%);
-  padding: 6px 8px;
-  border: 1px solid rgba(148, 163, 184, 0.13);
+  min-height: 28px;
+  padding: 4px 7px;
+  border: 1px solid var(--composer-line);
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
-  color: rgba(244, 244, 245, 0.88);
+  background: #3a3a3a;
+  color: #eeeeee;
   font-size: 12px;
+  line-height: 1.2;
 }
 
-.composer-file-chip > span {
+.input-dock.febguy-composer .composer-file-chip > span {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.composer-file-chip img {
-  width: 24px;
-  height: 24px;
+.input-dock.febguy-composer .composer-file-chip img {
+  width: 22px;
+  height: 22px;
   border-radius: 999px;
   object-fit: cover;
 }
 
-.composer-file-chip svg {
+.input-dock.febguy-composer .composer-file-chip svg {
   flex: 0 0 auto;
   width: 14px;
   height: 14px;
-  color: rgba(244, 244, 245, 0.72);
+  color: #cfcfcf;
 }
 
-.composer-file-chip button {
+.input-dock.febguy-composer .composer-file-chip button {
   display: inline-grid;
   place-items: center;
   width: 20px;
@@ -6167,63 +6192,58 @@ label {
   border: 0;
   border-radius: 999px;
   background: transparent;
-  color: rgba(244, 244, 245, 0.58);
+  color: #b8b8b8;
 }
 
-.composer-file-chip button:hover {
-  background: rgba(248, 113, 113, 0.16);
-  color: #fecaca;
+.input-dock.febguy-composer .composer-file-chip button:hover {
+  background: #4a4a4a;
+  color: #ffffff;
   transform: none;
 }
 
-.composer-right-controls {
+.input-dock.febguy-composer .composer-right-controls {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: flex-end;
   gap: 4px;
   margin-left: auto;
-  padding-bottom: 4px;
+  padding-bottom: 2px;
 }
 
-.composer-model-button {
-  min-height: 34px;
+.input-dock.febguy-composer .composer-model-button {
+  min-height: 36px;
   display: inline-flex;
   align-items: center;
   gap: 5px;
   padding: 0 8px;
   border-radius: 999px;
-  font-size: 13px;
-  font-weight: 600;
-  color: rgba(244, 244, 245, 0.72);
+  background: transparent;
+  color: #d0d0d0;
+  font-size: 14px;
+  font-weight: 500;
 }
 
-.composer-model-caret {
-  display: inline-block;
-  color: rgba(244, 244, 245, 0.48);
-  font-size: 10px;
-  line-height: 1;
-  transform: translateY(-1px) scaleX(1.15);
+.input-dock.febguy-composer .composer-model-caret {
+  width: 15px;
+  height: 15px;
+  color: #a8a8a8;
+  stroke-width: 2;
 }
 
-.input-dock.febguy-composer .send-action {
-  background: #f4f4f5;
-  color: #020617;
-  box-shadow: none;
-}
-
-.input-dock.febguy-composer .send-action:hover {
-  background: #ffffff;
-  color: #020617;
-}
-
+.input-dock.febguy-composer .send-action,
 .input-dock.febguy-composer .stop-action {
-  background: #f4f4f5;
-  color: #020617;
+  background: #f4f4f4;
+  color: #101010;
+}
+
+.input-dock.febguy-composer :is(.send-action, .stop-action):hover {
+  background: #ffffff;
+  color: #101010;
 }
 
 .input-dock.febguy-composer .voice-action {
   background: transparent;
-  color: rgba(244, 244, 245, 0.7);
+  color: #cfcfcf;
 }
 
 .composer-config-overlay {
@@ -6233,8 +6253,8 @@ label {
   display: grid;
   place-items: center;
   padding: 24px;
-  background: rgba(2, 6, 23, 0.58);
-  backdrop-filter: blur(12px);
+  background: rgba(0, 0, 0, 0.54);
+  backdrop-filter: blur(8px);
 }
 
 .composer-config-modal {
@@ -6242,10 +6262,10 @@ label {
   display: grid;
   gap: 18px;
   padding: 20px;
-  border: 1px solid rgba(148, 163, 184, 0.15);
-  border-radius: 24px;
-  background: rgba(24, 27, 33, 0.98);
-  box-shadow: 0 30px 90px rgba(0, 0, 0, 0.48);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 18px;
+  background: #2b2b2b;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.46);
 }
 
 .composer-config-header {
@@ -6256,27 +6276,33 @@ label {
 }
 
 .composer-config-header span {
-  color: rgba(244, 244, 245, 0.58);
+  color: #a8a8a8;
   font-size: 11px;
-  font-weight: 700;
+  font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
 .composer-config-header h2 {
   margin: 4px 0 0;
+  color: #f4f4f4;
   font-size: 22px;
+  font-weight: 650;
 }
 
 .composer-config-header button {
   display: inline-grid;
   place-items: center;
-  width: 38px;
-  height: 38px;
-  border: 0;
+  width: 36px;
+  height: 36px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
-  color: rgba(244, 244, 245, 0.82);
+  background: transparent;
+  color: #d1d1d1;
+}
+
+.composer-config-header button:hover {
+  background: #3a3a3a;
+  color: #ffffff;
 }
 
 .composer-config-modal section {
@@ -6286,8 +6312,9 @@ label {
 
 .composer-config-modal h3 {
   margin: 0;
-  color: rgba(244, 244, 245, 0.72);
+  color: #d0d0d0;
   font-size: 13px;
+  font-weight: 600;
 }
 
 .composer-config-options {
@@ -6297,18 +6324,18 @@ label {
 }
 
 .composer-config-options button {
-  min-height: 42px;
-  border: 1px solid rgba(148, 163, 184, 0.12);
-  border-radius: 14px;
-  background: rgba(255, 255, 255, 0.045);
-  color: rgba(244, 244, 245, 0.86);
-  font-weight: 700;
+  min-height: 40px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+  background: #343434;
+  color: #ececec;
+  font-weight: 600;
 }
 
 .composer-config-options button.active,
 .composer-config-options button:hover {
-  border-color: rgba(244, 244, 245, 0.22);
-  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.16);
+  background: #424242;
   color: #ffffff;
 }
 
@@ -6400,29 +6427,29 @@ label {
     border-radius: 24px;
   }
 
-  .composer-main-row {
+  .input-dock.febguy-composer .composer-main-row {
     align-items: flex-end;
     gap: 6px;
   }
 
-  .composer-right-controls {
+  .input-dock.febguy-composer .composer-right-controls {
     width: auto;
     justify-content: flex-end;
     flex-wrap: nowrap;
     gap: 2px;
   }
 
-  .composer-model-button {
+  .input-dock.febguy-composer .composer-model-button {
     padding-inline: 7px;
     font-size: 12px;
   }
 
-  .composer-file-chip-row {
+  .input-dock.febguy-composer .composer-file-chip-row {
     padding-left: 0;
   }
 
-  .composer-model-menu,
-  .composer-upload-menu {
+  .input-dock.febguy-composer .composer-model-menu,
+  .input-dock.febguy-composer .composer-upload-menu {
     position: fixed;
     left: 14px;
     right: 14px;
@@ -6436,7 +6463,7 @@ label {
     grid-template-columns: 1fr;
   }
 
-  .input-dock textarea {
+  .input-dock:not(.febguy-composer) textarea {
     min-height: 50px;
   }
 

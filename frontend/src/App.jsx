@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   BookOpen as BookIcon,
+  ChevronDown,
   CircleHelp as QuizIcon,
   Code2 as CodeIcon,
   Copy as CopyIcon,
@@ -26,7 +27,6 @@ import {
   Search as SearchIcon,
   ArrowUp as SendIcon,
   Settings2 as SettingsIcon,
-  SlidersHorizontal as TuneIcon,
   Square as StopIcon,
   ThumbsDown as NotHelpfulIcon,
   ThumbsUp as HelpfulIcon,
@@ -52,9 +52,9 @@ const META_PREFIX = "\n\n[[FEBGUY_META:";
 const META_SUFFIX = "]]";
 const answerLengthOptions = ["short", "standard", "detailed"];
 const modelModeOptions = [
-  { value: "fast", label: "Fast", icon: "\u26a1" },
-  { value: "smart", label: "Smart", icon: "\ud83e\udde0" },
-  { value: "deep", label: "Deep", icon: "\ud83d\udd2c" }
+  { value: "fast", label: "Fast" },
+  { value: "smart", label: "Smart" },
+  { value: "deep", label: "Deep" }
 ];
 const responseModeOptions = [
   { value: "balanced", label: "Balanced" },
@@ -969,6 +969,16 @@ function App() {
     }
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeMessages, workspace, loading, processingFile]);
+
+  useEffect(() => {
+    const textarea = composerRef.current;
+    if (!textarea) {
+      return;
+    }
+
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 190)}px`;
+  }, [message, workspace]);
 
   const createProfile = async (event) => {
     event.preventDefault();
@@ -4852,30 +4862,6 @@ function App() {
             />
           )}
 
-          {((selectedFile && !isCodeWorkspace) || (isCodeWorkspace && selectedCodeFiles.length > 0)) && (
-            <div className="composer-file-chip-row">
-              {selectedFile && !isCodeWorkspace && (
-                <span className="composer-file-chip">
-                  {filePreview ? <img src={filePreview} alt="" /> : <AttachIcon />}
-                  <span>{selectedFile.name}</span>
-                  <button type="button" onClick={resetFileInput} aria-label="Remove file">
-                    <CloseIcon />
-                  </button>
-                </span>
-              )}
-
-              {isCodeWorkspace && selectedCodeFiles.map(fileItem => (
-                <span className="composer-file-chip" key={`${fileItem.name}-${fileItem.size}`}>
-                  <CodeFileIcon />
-                  <span>{fileItem.name}</span>
-                  <button type="button" onClick={resetFileInput} aria-label="Remove code files">
-                    <CloseIcon />
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-
           <div className="composer-main-row">
             <div className="composer-upload-wrap">
               <button
@@ -4884,6 +4870,7 @@ function App() {
                 onClick={() => setComposerUploadMenuOpen(open => !open)}
                 disabled={isBusy}
                 aria-label="Open upload menu"
+                aria-haspopup="menu"
                 aria-expanded={composerUploadMenuOpen}
               >
                 <PlusIcon />
@@ -4933,10 +4920,11 @@ function App() {
                     className="composer-model-button"
                     onClick={() => setComposerModelMenuOpen(open => !open)}
                     aria-label="Choose model quality"
+                    aria-haspopup="menu"
                     aria-expanded={composerModelMenuOpen}
                   >
                     <span className="composer-model-label">{selectedModelMode.label}</span>
-                    <span className="composer-model-caret" aria-hidden="true">v</span>
+                    <ChevronDown className="composer-model-caret" aria-hidden="true" />
                   </button>
 
                   {composerModelMenuOpen && (
@@ -4953,7 +4941,7 @@ function App() {
                             setComposerModelMenuOpen(false);
                           }}
                         >
-                          <strong>{option.label}</strong>
+                          {option.label}
                         </button>
                       ))}
                       <button
@@ -4964,8 +4952,7 @@ function App() {
                           setComposerConfigOpen(true);
                         }}
                       >
-                        <TuneIcon />
-                        <span>Configure...</span>
+                        <span>Configure</span>
                       </button>
                     </div>
                   )}
@@ -4995,6 +4982,30 @@ function App() {
               )}
             </div>
           </div>
+
+          {((selectedFile && !isCodeWorkspace) || (isCodeWorkspace && selectedCodeFiles.length > 0)) && (
+            <div className="composer-file-chip-row">
+              {selectedFile && !isCodeWorkspace && (
+                <span className="composer-file-chip">
+                  {filePreview ? <img src={filePreview} alt="" /> : <AttachIcon />}
+                  <span>{selectedFile.name}</span>
+                  <button type="button" onClick={resetFileInput} aria-label="Remove file">
+                    <CloseIcon />
+                  </button>
+                </span>
+              )}
+
+              {isCodeWorkspace && selectedCodeFiles.map(fileItem => (
+                <span className="composer-file-chip" key={`${fileItem.name}-${fileItem.size}`}>
+                  <CodeFileIcon />
+                  <span>{fileItem.name}</span>
+                  <button type="button" onClick={resetFileInput} aria-label="Remove code files">
+                    <CloseIcon />
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
         </form>
 
         {composerConfigOpen && (
@@ -5020,7 +5031,6 @@ function App() {
                       className={modelMode === option.value ? "active" : ""}
                       onClick={() => setModelModePreference(option.value)}
                     >
-                      <span>{option.icon}</span>
                       {option.label}
                     </button>
                   ))}
