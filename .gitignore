@@ -13,6 +13,7 @@ backend/__pycache__/
 *.pyo
 *.pyd
 archive/
+backend/data/
 
 # Backend database / private files
 backend/*.db
