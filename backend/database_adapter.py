@@ -18,6 +18,8 @@ class DatabaseSettings:
     database_url: str = ""
     provider: str = "sqlite"
     connect_timeout: int = 5
+    statement_timeout_ms: int = 5000
+    lock_timeout_ms: int = 3000
     supabase_url: str = ""
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
@@ -69,17 +71,32 @@ class DatabaseService:
         conn.execute("PRAGMA journal_mode = WAL")
         return conn
 
-    def postgres_connect(self):
+    def postgres_connect(self, connect_timeout: int | None = None):
         if psycopg is None:
             raise RuntimeError("psycopg is not installed")
         if not self.settings.database_url:
             raise RuntimeError("DATABASE_URL is not configured")
+        timeout = (
+            self.settings.connect_timeout
+            if connect_timeout is None
+            else connect_timeout
+        )
         conn = psycopg.connect(
             self.settings.database_url,
-            connect_timeout=max(1, int(self.settings.connect_timeout or 5)),
+            connect_timeout=max(1, int(timeout or 5)),
         )
         with conn.cursor() as cur:
             cur.execute("SET search_path TO public")
+            if self.settings.statement_timeout_ms:
+                statement_timeout_ms = max(1, int(self.settings.statement_timeout_ms))
+                cur.execute(
+                    f"SET statement_timeout TO {statement_timeout_ms}"
+                )
+            if self.settings.lock_timeout_ms:
+                lock_timeout_ms = max(1, int(self.settings.lock_timeout_ms))
+                cur.execute(
+                    f"SET lock_timeout TO {lock_timeout_ms}"
+                )
         return conn
 
     def supabase_status(self) -> dict[str, bool]:
@@ -123,7 +140,8 @@ class DatabaseService:
             return status
 
         try:
-            with self.postgres_connect() as conn:
+            health_timeout = min(2, max(1, int(self.settings.connect_timeout or 5)))
+            with self.postgres_connect(connect_timeout=health_timeout) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     cur.fetchone()
