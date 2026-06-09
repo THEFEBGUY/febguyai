@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
+import queue
+import threading
 import uuid as uuid_module
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +22,8 @@ class DatabaseSettings:
     connect_timeout: int = 5
     statement_timeout_ms: int = 5000
     lock_timeout_ms: int = 3000
+    pool_max_size: int = 5
+    pool_timeout: int = 5
     supabase_url: str = ""
     supabase_anon_key: str = ""
     supabase_service_role_key: str = ""
@@ -36,6 +40,9 @@ class DatabaseService:
     def __init__(self, settings: DatabaseSettings):
         self.settings = settings
         self.requested_provider = self._normalize_provider(settings.provider)
+        self._pool_lock = threading.Lock()
+        self._postgres_pool: queue.LifoQueue[Any] | None = None
+        self._postgres_pool_open_connections = 0
 
     @staticmethod
     def _normalize_provider(provider: str | None) -> str:
@@ -60,6 +67,11 @@ class DatabaseService:
 
     def connect(self):
         if self.is_postgres_active():
+            if self._postgres_pool_max_size() > 0:
+                return PostgresCompatConnection(
+                    self.acquire_postgres_connection(),
+                    release=self.release_postgres_connection,
+                )
             return PostgresCompatConnection(self.postgres_connect())
         return self.sqlite_connect()
 
@@ -81,23 +93,105 @@ class DatabaseService:
             if connect_timeout is None
             else connect_timeout
         )
-        conn = psycopg.connect(
-            self.settings.database_url,
-            connect_timeout=max(1, int(timeout or 5)),
-        )
-        with conn.cursor() as cur:
-            cur.execute("SET search_path TO public")
-            if self.settings.statement_timeout_ms:
-                statement_timeout_ms = max(1, int(self.settings.statement_timeout_ms))
-                cur.execute(
-                    f"SET statement_timeout TO {statement_timeout_ms}"
-                )
-            if self.settings.lock_timeout_ms:
-                lock_timeout_ms = max(1, int(self.settings.lock_timeout_ms))
-                cur.execute(
-                    f"SET lock_timeout TO {lock_timeout_ms}"
-                )
+        connect_kwargs: dict[str, Any] = {
+            "connect_timeout": max(1, int(timeout or 5)),
+            "prepare_threshold": None,
+        }
+        options = self._postgres_connect_options()
+        if options:
+            connect_kwargs["options"] = options
+        conn = psycopg.connect(self.settings.database_url, **connect_kwargs)
+        try:
+            conn.prepare_threshold = None
+        except Exception:
+            pass
         return conn
+
+    def _postgres_connect_options(self) -> str:
+        options = ["-c search_path=public"]
+        if self.settings.statement_timeout_ms:
+            options.append(
+                f"-c statement_timeout={max(1, int(self.settings.statement_timeout_ms))}"
+            )
+        if self.settings.lock_timeout_ms:
+            options.append(
+                f"-c lock_timeout={max(1, int(self.settings.lock_timeout_ms))}"
+            )
+        return " ".join(options)
+
+    def _postgres_pool_max_size(self) -> int:
+        return max(0, int(self.settings.pool_max_size or 0))
+
+    def _postgres_pool_timeout(self) -> int:
+        return max(1, int(self.settings.pool_timeout or self.settings.connect_timeout or 5))
+
+    def _ensure_postgres_pool(self) -> queue.LifoQueue[Any]:
+        if self._postgres_pool is None:
+            with self._pool_lock:
+                if self._postgres_pool is None:
+                    self._postgres_pool = queue.LifoQueue(
+                        maxsize=max(1, self._postgres_pool_max_size())
+                    )
+        return self._postgres_pool
+
+    @staticmethod
+    def _postgres_connection_usable(conn: Any) -> bool:
+        return not bool(getattr(conn, "closed", False))
+
+    def acquire_postgres_connection(self):
+        pool = self._ensure_postgres_pool()
+        while True:
+            try:
+                conn = pool.get_nowait()
+            except queue.Empty:
+                break
+            if self._postgres_connection_usable(conn):
+                return conn
+            self._discard_postgres_connection(conn)
+
+        should_open = False
+        with self._pool_lock:
+            if self._postgres_pool_open_connections < self._postgres_pool_max_size():
+                self._postgres_pool_open_connections += 1
+                should_open = True
+
+        if should_open:
+            try:
+                return self.postgres_connect()
+            except Exception:
+                with self._pool_lock:
+                    self._postgres_pool_open_connections = max(
+                        0,
+                        self._postgres_pool_open_connections - 1,
+                    )
+                raise
+
+        while True:
+            conn = pool.get(timeout=self._postgres_pool_timeout())
+            if self._postgres_connection_usable(conn):
+                return conn
+            self._discard_postgres_connection(conn)
+
+    def release_postgres_connection(self, conn: Any, reusable: bool) -> None:
+        if not reusable or not self._postgres_connection_usable(conn):
+            self._discard_postgres_connection(conn)
+            return
+        pool = self._ensure_postgres_pool()
+        try:
+            pool.put_nowait(conn)
+        except queue.Full:
+            self._discard_postgres_connection(conn)
+
+    def _discard_postgres_connection(self, conn: Any) -> None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        with self._pool_lock:
+            self._postgres_pool_open_connections = max(
+                0,
+                self._postgres_pool_open_connections - 1,
+            )
 
     def supabase_status(self) -> dict[str, bool]:
         return {
@@ -244,21 +338,38 @@ class PostgresCompatCursor:
 
 
 class PostgresCompatConnection:
-    def __init__(self, conn):
+    def __init__(self, conn, release=None):
         self._conn = conn
+        self._release = release
+        self._closed = False
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, traceback):
+        reusable = False
         try:
             if exc_type is None:
                 self._conn.commit()
             else:
                 self._conn.rollback()
+            reusable = True
+        except Exception:
+            reusable = False
+            if exc_type is None:
+                raise
         finally:
-            self._conn.close()
+            self._finish(reusable)
         return False
+
+    def _finish(self, reusable: bool) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._release:
+            self._release(self._conn, reusable)
+            return
+        self._conn.close()
 
     def execute(self, sql: str, params: Iterable[Any] | None = None) -> PostgresCompatCursor:
         cursor = PostgresCompatCursor(self._conn.cursor())
@@ -289,7 +400,17 @@ class PostgresCompatConnection:
         self._conn.rollback()
 
     def close(self) -> None:
-        self._conn.close()
+        reusable = False
+        try:
+            self._conn.commit()
+            reusable = True
+        except Exception:
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
+        finally:
+            self._finish(reusable)
 
 
 def translate_sql(sql: str, params: Iterable[Any] | None) -> tuple[str, Iterable[Any] | None]:

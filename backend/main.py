@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import base64
+import contextvars
 import hashlib
 import html
 import io
@@ -99,6 +100,20 @@ try:
     )
 except ValueError:
     POSTGRES_LOCK_TIMEOUT_MS = 3000
+try:
+    POSTGRES_POOL_MAX_SIZE = max(
+        1,
+        int(os.getenv("POSTGRES_POOL_MAX_SIZE", "5") or "5"),
+    )
+except ValueError:
+    POSTGRES_POOL_MAX_SIZE = 5
+try:
+    POSTGRES_POOL_TIMEOUT = max(
+        1,
+        int(os.getenv("POSTGRES_POOL_TIMEOUT", str(POSTGRES_CONNECT_TIMEOUT)) or str(POSTGRES_CONNECT_TIMEOUT)),
+    )
+except ValueError:
+    POSTGRES_POOL_TIMEOUT = POSTGRES_CONNECT_TIMEOUT
 DATABASE_PROVIDER = (
     os.getenv("DATABASE_PROVIDER")
     or os.getenv("FEBGUY_DATABASE_PROVIDER")
@@ -383,11 +398,25 @@ if not logging.getLogger().handlers:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+try:
+    SLOW_ENDPOINT_LOG_MS = max(
+        250,
+        int(os.getenv("SLOW_ENDPOINT_LOG_MS", "2000") or "2000"),
+    )
+except ValueError:
+    SLOW_ENDPOINT_LOG_MS = 2000
+REQUEST_DB_TIME: contextvars.ContextVar[float] = contextvars.ContextVar("request_db_time", default=0.0)
+REQUEST_AI_TIME: contextvars.ContextVar[float] = contextvars.ContextVar("request_ai_time", default=0.0)
+REQUEST_TIMING_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_timing_id", default=None)
+REQUEST_TIMING_TOTALS: dict[str, dict[str, float]] = {}
+REQUEST_TIMING_LOCK = threading.Lock()
 DATA_LOCK = threading.RLock()
 DATABASE_INITIALIZED = False
 SESSION_ACCESS_CACHE_SECONDS = 120
 SESSION_ACCESS_CACHE: dict[str, dict[str, Any]] = {}
 SESSION_ACCESS_LOCK = threading.Lock()
+GUEST_DEVICE_SESSION_CACHE: dict[str, dict[str, Any]] = {}
+GUEST_DEVICE_SESSION_LOCK = threading.Lock()
 TABLE_COLUMN_CACHE: dict[tuple[str, str], set[str]] = {}
 TABLE_COLUMN_LOCK = threading.Lock()
 try:
@@ -408,6 +437,8 @@ DATABASE = DatabaseService(
         connect_timeout=POSTGRES_CONNECT_TIMEOUT,
         statement_timeout_ms=POSTGRES_STATEMENT_TIMEOUT_MS,
         lock_timeout_ms=POSTGRES_LOCK_TIMEOUT_MS,
+        pool_max_size=POSTGRES_POOL_MAX_SIZE,
+        pool_timeout=POSTGRES_POOL_TIMEOUT,
         supabase_url=SUPABASE_URL,
         supabase_anon_key=SUPABASE_ANON_KEY,
         supabase_service_role_key=SUPABASE_SERVICE_ROLE_KEY,
@@ -618,6 +649,12 @@ async def handle_unexpected_error(request: Request, exc: Exception):
 @app.middleware("http")
 async def attach_device_context(request: Request, call_next):
     request.state.request_id = str(uuid.uuid4())
+    REQUEST_DB_TIME.set(0.0)
+    REQUEST_AI_TIME.set(0.0)
+    timing_token = REQUEST_TIMING_ID.set(request.state.request_id)
+    with REQUEST_TIMING_LOCK:
+        REQUEST_TIMING_TOTALS[request.state.request_id] = {"db": 0.0, "ai": 0.0}
+    started_at = time.perf_counter()
     try:
         content_length = request.headers.get("content-length", "").strip()
         if content_length:
@@ -642,9 +679,28 @@ async def attach_device_context(request: Request, call_next):
             request=request,
             headers=exc.headers,
         )
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request.state.request_id
-    return response
+    try:
+        response = await call_next(request)
+        return response
+    finally:
+        total_ms = (time.perf_counter() - started_at) * 1000
+        with REQUEST_TIMING_LOCK:
+            totals = REQUEST_TIMING_TOTALS.pop(request.state.request_id, {"db": REQUEST_DB_TIME.get(), "ai": REQUEST_AI_TIME.get()})
+        REQUEST_TIMING_ID.reset(timing_token)
+        db_ms = totals.get("db", 0.0) * 1000
+        ai_ms = totals.get("ai", 0.0) * 1000
+        if total_ms >= SLOW_ENDPOINT_LOG_MS:
+            LOGGER.info(
+                "slow_endpoint endpoint=%s method=%s status=%s db_ms=%.1f ai_ms=%.1f total_ms=%.1f",
+                request.url.path,
+                request.method,
+                getattr(locals().get("response", None), "status_code", "unknown"),
+                db_ms,
+                ai_ms,
+                total_ms,
+            )
+        if "response" in locals():
+            response.headers["X-Request-ID"] = request.state.request_id
 
 
 SYSTEM_PROMPT = """
@@ -844,8 +900,66 @@ def decode_json(raw: str | None, default: Any) -> Any:
         return default
 
 
+def add_request_db_time(elapsed: float) -> None:
+    REQUEST_DB_TIME.set(REQUEST_DB_TIME.get() + elapsed)
+    request_id = REQUEST_TIMING_ID.get()
+    if request_id:
+        with REQUEST_TIMING_LOCK:
+            totals = REQUEST_TIMING_TOTALS.setdefault(request_id, {"db": 0.0, "ai": 0.0})
+            totals["db"] += elapsed
+
+
+def add_request_ai_time(elapsed: float) -> None:
+    REQUEST_AI_TIME.set(REQUEST_AI_TIME.get() + elapsed)
+    request_id = REQUEST_TIMING_ID.get()
+    if request_id:
+        with REQUEST_TIMING_LOCK:
+            totals = REQUEST_TIMING_TOTALS.setdefault(request_id, {"db": 0.0, "ai": 0.0})
+            totals["ai"] += elapsed
+
+
+class TimedDatabaseConnection:
+    def __init__(self, conn: Any):
+        self._conn = conn
+
+    def __enter__(self):
+        if hasattr(self._conn, "__enter__"):
+            self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if hasattr(self._conn, "__exit__"):
+            return self._conn.__exit__(exc_type, exc, traceback)
+        self.close()
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._conn, name)
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        start = time.perf_counter()
+        try:
+            return self._conn.execute(*args, **kwargs)
+        finally:
+            add_request_db_time(time.perf_counter() - start)
+
+    def executemany(self, *args: Any, **kwargs: Any) -> Any:
+        start = time.perf_counter()
+        try:
+            return self._conn.executemany(*args, **kwargs)
+        finally:
+            add_request_db_time(time.perf_counter() - start)
+
+    def executescript(self, *args: Any, **kwargs: Any) -> Any:
+        start = time.perf_counter()
+        try:
+            return self._conn.executescript(*args, **kwargs)
+        finally:
+            add_request_db_time(time.perf_counter() - start)
+
+
 def db_connect() -> Any:
-    return DATABASE.connect()
+    return TimedDatabaseConnection(DATABASE.connect())
 
 
 def postgres_connect():
@@ -869,6 +983,28 @@ def database_health_status(*, force: bool = False) -> dict[str, Any]:
         and time.monotonic() - checked_at < DATABASE_HEALTH_CACHE_SECONDS
     ):
         return dict(cached_status)
+
+    if not force and DATABASE.is_postgres_active():
+        status = {
+            "active_provider": "postgres" if DATABASE_URL else "unavailable",
+            "requested_provider": DATABASE.requested_provider,
+            "database_url_required": True,
+            "sqlite_available": False,
+            "postgres_configured": bool(DATABASE_URL),
+            "postgres_connected": bool(DATABASE_URL),
+            "sqlite": {"available": False, "configured": True, "status": "inactive"},
+            "postgres": {
+                "configured": bool(DATABASE_URL),
+                "connected": bool(DATABASE_URL),
+                "status": "configured_fast_health" if DATABASE_URL else "not_configured",
+            },
+            "supabase": supabase_config_status(),
+            "migration_mode": "postgres_active",
+        }
+        with DATABASE_HEALTH_LOCK:
+            DATABASE_HEALTH_CACHE["checked_at"] = time.monotonic()
+            DATABASE_HEALTH_CACHE["status"] = dict(status)
+        return status
 
     status = DATABASE.safe_health()
     with DATABASE_HEALTH_LOCK:
@@ -1927,6 +2063,41 @@ def ownership_scope_for_profile(
     }
 
 
+def ownership_scope_from_profile(profile: dict[str, Any]) -> dict[str, str | None] | None:
+    profile_id = profile.get("id")
+    if not profile_id:
+        return None
+
+    if profile.get("is_guest") and profile.get("guest_id") and profile.get("device_id"):
+        return {
+            "mode": "guest",
+            "profile_id": profile_id,
+            "user_id": None,
+            "guest_id": profile.get("guest_id"),
+            "device_id": profile.get("device_id"),
+        }
+
+    if profile.get("user_id"):
+        return {
+            "mode": "profile",
+            "profile_id": profile_id,
+            "user_id": profile.get("user_id"),
+            "guest_id": None,
+            "device_id": profile.get("device_id"),
+        }
+
+    if profile.get("profile_kind") in {None, "", "legacy"}:
+        return {
+            "mode": "legacy",
+            "profile_id": profile_id,
+            "user_id": None,
+            "guest_id": None,
+            "device_id": None,
+        }
+
+    return None
+
+
 def owner_values(scope: dict[str, str | None]) -> tuple[str | None, str | None, str | None]:
     return scope.get("user_id"), scope.get("guest_id"), scope.get("device_id")
 
@@ -2154,6 +2325,19 @@ def message_to_payload(message: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def is_saved_backend_failure_message(message: dict[str, Any]) -> bool:
+    if normalize_message_role(message.get("role")) != "assistant":
+        return False
+    text = str(message.get("text") or "").strip().lower()
+    failure_markers = (
+        "backend unavailable",
+        "failed to fetch",
+        "start the fastapi backend",
+        "check the app url",
+    )
+    return any(marker in text for marker in failure_markers)
+
+
 def upsert_chat_row(
     conn: sqlite3.Connection,
     profile_id: str,
@@ -2234,6 +2418,36 @@ def upsert_chat_row(
             raise
 
 
+def insert_empty_chat_row(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    chat_item: dict[str, Any],
+    scope: dict[str, str | None] | None = None,
+) -> None:
+    scope = scope or ownership_scope_for_profile(profile_id, conn)
+    chat_item = normalize_chat({**chat_item, "messages": []})
+    conn.execute(
+        """
+        INSERT INTO chats
+            (id, profile_id, user_id, guest_id, device_id, title, summary,
+             last_uploaded_file, pinned, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        (
+            chat_item["id"],
+            profile_id,
+            *owner_values(scope),
+            chat_item["title"],
+            chat_item["summary"],
+            encode_json(chat_item.get("last_uploaded_file")),
+            int(bool(chat_item.get("pinned"))),
+            chat_item["created_at"],
+            chat_item["updated_at"],
+        ),
+    )
+
+
 def row_to_chat(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2261,6 +2475,21 @@ def row_to_chat(
             "title": row["title"],
             "summary": row["summary"],
             "messages": messages,
+            "last_uploaded_file": decode_json(row["last_uploaded_file"], None),
+            "pinned": bool(row["pinned"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+    )
+
+
+def row_to_chat_metadata(row: sqlite3.Row) -> dict[str, Any]:
+    return normalize_chat(
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "messages": [],
             "last_uploaded_file": decode_json(row["last_uploaded_file"], None),
             "pinned": bool(row["pinned"]),
             "created_at": row["created_at"],
@@ -2347,6 +2576,35 @@ def upsert_code_chat_row(
             raise
 
 
+def insert_empty_code_chat_row(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    chat_item: dict[str, Any],
+    scope: dict[str, str | None] | None = None,
+) -> None:
+    scope = scope or ownership_scope_for_profile(profile_id, conn)
+    chat_item = normalize_chat({**chat_item, "messages": []})
+    conn.execute(
+        """
+        INSERT INTO code_chats
+            (id, profile_id, user_id, guest_id, device_id, title, summary,
+             pinned, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        (
+            chat_item["id"],
+            profile_id,
+            *owner_values(scope),
+            chat_item["title"],
+            chat_item["summary"],
+            int(bool(chat_item.get("pinned"))),
+            chat_item["created_at"],
+            chat_item["updated_at"],
+        ),
+    )
+
+
 def row_to_code_chat(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2383,6 +2641,22 @@ def row_to_code_chat(
     return chat_item
 
 
+def row_to_code_chat_metadata(row: sqlite3.Row) -> dict[str, Any]:
+    chat_item = normalize_chat(
+        {
+            "id": row["id"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "messages": [],
+            "pinned": bool(row["pinned"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+    )
+    chat_item["projectFiles"] = []
+    return chat_item
+
+
 def upsert_file_row(
     conn: sqlite3.Connection,
     profile_id: str,
@@ -2397,6 +2671,13 @@ def upsert_file_row(
     if not raw_path:
         return
     clean_path = str(ensure_controlled_file_path(Path(raw_path)))
+    safe_name = str(file_name or Path(clean_path).name or "file").strip() or "file"
+    safe_type = str(file_type or "application/octet-stream").strip() or "application/octet-stream"
+    timestamp = now_iso()
+    try:
+        size_bytes = ensure_controlled_file_path(Path(clean_path)).stat().st_size
+    except OSError:
+        size_bytes = 0
     scope = scope or ownership_scope_for_profile(profile_id, conn)
     ensure_scope_device_row(conn, scope)
     owner_clause, owner_params = owner_where(scope)
@@ -2410,34 +2691,67 @@ def upsert_file_row(
     ).fetchone():
         raise HTTPException(status_code=403, detail="This file belongs to another workspace.")
     file_id = existing["id"] if existing else str(uuid.uuid4())
-    created_at = existing["created_at"] if existing else now_iso()
+    created_at = existing["created_at"] if existing else timestamp
+    columns = table_column_names(conn, "files")
+    values: dict[str, Any] = {
+        "id": file_id,
+        "profile_id": profile_id,
+        "user_id": scope.get("user_id"),
+        "guest_id": scope.get("guest_id"),
+        "device_id": scope.get("device_id"),
+        "file_name": safe_name,
+        "original_name": safe_name,
+        "file_type": safe_type,
+        "mime_type": safe_type,
+        "path": clean_path,
+        "storage_path": clean_path,
+        "document_id": document_id,
+        "size_bytes": size_bytes,
+        "metadata": encode_json({}),
+        "created_at": created_at,
+        "updated_at": timestamp,
+    }
+    insert_order = [
+        "id",
+        "profile_id",
+        "user_id",
+        "guest_id",
+        "device_id",
+        "file_name",
+        "original_name",
+        "file_type",
+        "mime_type",
+        "path",
+        "storage_path",
+        "document_id",
+        "size_bytes",
+        "metadata",
+        "created_at",
+        "updated_at",
+    ]
+    insert_columns = [column for column in insert_order if column in columns]
+    if not insert_columns:
+        return
+    placeholders = ", ".join(
+        "CAST(? AS jsonb)"
+        if column == "metadata" and DATABASE.is_postgres_active()
+        else "?"
+        for column in insert_columns
+    )
+    update_columns = [
+        column
+        for column in insert_columns
+        if column not in {"id", "created_at"}
+    ]
+    update_sql = ", ".join(f"{column} = excluded.{column}" for column in update_columns)
+    conflict_sql = f"ON CONFLICT(id) DO UPDATE SET {update_sql}" if update_sql else "ON CONFLICT(id) DO NOTHING"
     conn.execute(
-        """
-        INSERT INTO files
-            (id, profile_id, user_id, guest_id, device_id, file_name,
-             file_type, path, document_id, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            profile_id = excluded.profile_id,
-            user_id = excluded.user_id,
-            guest_id = excluded.guest_id,
-            device_id = excluded.device_id,
-            file_name = excluded.file_name,
-            file_type = excluded.file_type,
-            path = excluded.path,
-            document_id = excluded.document_id,
-            created_at = excluded.created_at
+        f"""
+        INSERT INTO files ({", ".join(insert_columns)})
+        VALUES ({placeholders})
+        {conflict_sql}
         """,
-        (
-            file_id,
-            profile_id,
-            *owner_values(scope),
-            file_name or Path(clean_path).name,
-            file_type or "",
-            clean_path,
-            document_id,
-            created_at,
-        ),
+        tuple(values[column] for column in insert_columns),
     )
 
 
@@ -3140,6 +3454,7 @@ def create_account_session(user_id: str) -> str:
 
 
 def delete_session(token: str) -> None:
+    clear_session_caches(token)
     with DATA_LOCK:
         with db_connect() as conn:
             conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
@@ -3335,6 +3650,9 @@ def create_or_load_guest_session(device_id: str | None) -> dict[str, Any]:
     normalized_device_id = validate_device_id(device_id)
     if not normalized_device_id:
         raise HTTPException(status_code=400, detail="Guest mode requires a valid device ID.")
+    cached_response = cached_guest_start_response(normalized_device_id)
+    if cached_response:
+        return cached_response
 
     ensure_files()
     session_token = secrets.token_urlsafe(32)
@@ -3559,6 +3877,12 @@ def create_or_load_guest_session(device_id: str | None) -> dict[str, Any]:
         profile=profile,
         guest_id=guest_id,
         user_id=profile.get("user_id"),
+    )
+    cache_guest_start_response(
+        device_id=normalized_device_id,
+        profile=profile,
+        token=session_token,
+        guest_id=guest_id,
     )
     return {
         "profile": public_profile(profile),
@@ -3867,6 +4191,51 @@ def cached_guest_session_context(token: str) -> dict[str, Any] | None:
     }
 
 
+def cached_guest_start_response(device_id: str | None) -> dict[str, Any] | None:
+    if not device_id:
+        return None
+    with GUEST_DEVICE_SESSION_LOCK:
+        cached = GUEST_DEVICE_SESSION_CACHE.get(device_id)
+        if not cached:
+            return None
+        if time.monotonic() - float(cached.get("checked_at") or 0.0) > SESSION_ACCESS_CACHE_SECONDS:
+            GUEST_DEVICE_SESSION_CACHE.pop(device_id, None)
+            return None
+        return {
+            "profile": dict(cached["profile"]),
+            "token": cached["token"],
+            "session_mode": "guest",
+            "guest": dict(cached["guest"]),
+        }
+
+
+def cache_guest_start_response(
+    *,
+    device_id: str,
+    profile: dict[str, Any],
+    token: str,
+    guest_id: str,
+) -> None:
+    with GUEST_DEVICE_SESSION_LOCK:
+        GUEST_DEVICE_SESSION_CACHE[device_id] = {
+            "checked_at": time.monotonic(),
+            "profile": public_profile(profile),
+            "token": token,
+            "guest": {"id": guest_id},
+        }
+
+
+def clear_session_caches(token: str | None) -> None:
+    if not token:
+        return
+    with SESSION_ACCESS_LOCK:
+        SESSION_ACCESS_CACHE.pop(token, None)
+    with GUEST_DEVICE_SESSION_LOCK:
+        for device_id, cached in list(GUEST_DEVICE_SESSION_CACHE.items()):
+            if cached.get("token") == token:
+                GUEST_DEVICE_SESSION_CACHE.pop(device_id, None)
+
+
 def enforce_device_bound_session_access(
     authorization: str | None,
     device_id: str | None,
@@ -4164,14 +4533,15 @@ def save_effective_settings(profile: dict[str, Any], updates: dict[str, Any]) ->
 def normalize_chat(chat_item: dict[str, Any]) -> dict[str, Any]:
     created_at = normalize_timestamp_value(chat_item.get("created_at"))
     updated_at = normalize_timestamp_value(chat_item.get("updated_at"), created_at)
+    messages = [
+        message_to_payload(item) if isinstance(item, dict) else message_to_payload({"text": str(item)})
+        for item in (chat_item.get("messages") or [])
+    ]
     return {
         "id": chat_item.get("id") or str(uuid.uuid4()),
         "title": chat_item.get("title") or "New Chat",
         "summary": chat_item.get("summary") or "",
-        "messages": [
-            message_to_payload(item) if isinstance(item, dict) else message_to_payload({"text": str(item)})
-            for item in (chat_item.get("messages") or [])
-        ],
+        "messages": [message for message in messages if not is_saved_backend_failure_message(message)],
         "last_uploaded_file": chat_item.get("last_uploaded_file"),
         "pinned": bool(chat_item.get("pinned", False)),
         "created_at": created_at,
@@ -4208,6 +4578,28 @@ def load_chats(profile_id: str) -> list[dict[str, Any]]:
             owner_params,
         ).fetchall()
         chats = [row_to_chat(conn, row, scope) for row in rows]
+    return sort_chats(chats)
+
+
+def load_chat_metadata(
+    profile_id: str,
+    scope: dict[str, str | None] | None = None,
+) -> list[dict[str, Any]]:
+    ensure_files()
+    with db_connect() as conn:
+        scope = scope or ownership_scope_for_profile(profile_id, conn)
+        owner_clause, owner_params = owner_where(scope)
+        rows = conn.execute(
+            f"""
+            SELECT id, profile_id, title, summary, last_uploaded_file,
+                pinned, created_at, updated_at
+            FROM chats
+            WHERE {owner_clause}
+            ORDER BY pinned DESC, updated_at DESC
+            """,
+            owner_params,
+        ).fetchall()
+        chats = [row_to_chat_metadata(row) for row in rows]
     return sort_chats(chats)
 
 
@@ -4262,6 +4654,27 @@ def load_code_chats(profile_id: str) -> list[dict[str, Any]]:
             owner_params,
         ).fetchall()
         chats = [row_to_code_chat(conn, row, scope) for row in rows]
+    return sort_chats(chats)
+
+
+def load_code_chat_metadata(
+    profile_id: str,
+    scope: dict[str, str | None] | None = None,
+) -> list[dict[str, Any]]:
+    ensure_files()
+    with db_connect() as conn:
+        scope = scope or ownership_scope_for_profile(profile_id, conn)
+        owner_clause, owner_params = owner_where(scope)
+        rows = conn.execute(
+            f"""
+            SELECT id, profile_id, title, summary, pinned, created_at, updated_at
+            FROM code_chats
+            WHERE {owner_clause}
+            ORDER BY pinned DESC, updated_at DESC
+            """,
+            owner_params,
+        ).fetchall()
+        chats = [row_to_code_chat_metadata(row) for row in rows]
     return sort_chats(chats)
 
 
@@ -9189,9 +9602,13 @@ def call_text_model(
     images: list[Any] | None = None,
     allow_image_fallback: bool = True,
 ) -> str:
-    if images:
-        return call_gemini_vision(prompt, images)
-    return clean_model_output(groq_chat_completion(prompt, model=model))
+    started_at = time.perf_counter()
+    try:
+        if images:
+            return call_gemini_vision(prompt, images)
+        return clean_model_output(groq_chat_completion(prompt, model=model))
+    finally:
+        add_request_ai_time(time.perf_counter() - started_at)
 
 
 def build_response_refiner_prompt(
@@ -9275,10 +9692,14 @@ def stream_text_model(
     images: list[Any] | None = None,
     allow_image_fallback: bool = True,
 ) -> Iterable[str]:
-    if images:
-        yield call_gemini_vision(prompt, images)
-        return
-    yield from without_thinking_stream(stream_groq_chat_completion(prompt, model=model))
+    started_at = time.perf_counter()
+    try:
+        if images:
+            yield call_gemini_vision(prompt, images)
+            return
+        yield from without_thinking_stream(stream_groq_chat_completion(prompt, model=model))
+    finally:
+        add_request_ai_time(time.perf_counter() - started_at)
 
 
 def model_status() -> dict[str, Any]:
@@ -10419,7 +10840,7 @@ def download_file(
 @app.get("/chats")
 def get_chats(authorization: str | None = Header(None)) -> dict[str, list[dict[str, Any]]]:
     profile = require_workspace_session(authorization)
-    return {"chats": load_chats(profile["id"])}
+    return {"chats": load_chat_metadata(profile["id"], ownership_scope_from_profile(profile))}
 
 
 @app.post("/chats/new")
@@ -10428,7 +10849,6 @@ def create_chat(
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     profile = require_workspace_session(authorization)
-    chats = load_chats(profile["id"])
     new_chat = normalize_chat(
         {
             "id": str(uuid.uuid4()),
@@ -10437,8 +10857,10 @@ def create_chat(
             "updated_at": now_iso(),
         }
     )
-    chats.insert(0, new_chat)
-    save_chats(profile["id"], chats)
+    with DATA_LOCK:
+        with db_connect() as conn:
+            scope = ownership_scope_from_profile(profile) or ownership_scope_for_profile(profile["id"], conn)
+            insert_empty_chat_row(conn, profile["id"], new_chat, scope)
     return new_chat
 
 
@@ -10513,7 +10935,7 @@ def export_chat(chat_id: str, authorization: str | None = Header(None)):
 @app.get("/code/chats")
 def get_code_chats(authorization: str | None = Header(None)) -> dict[str, list[dict[str, Any]]]:
     profile = require_workspace_session(authorization)
-    return {"chats": load_code_chats(profile["id"])}
+    return {"chats": load_code_chat_metadata(profile["id"], ownership_scope_from_profile(profile))}
 
 
 @app.post("/code/chats/new")
@@ -10522,7 +10944,6 @@ def create_code_chat(
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     profile = require_workspace_session(authorization)
-    chats = load_code_chats(profile["id"])
     new_chat = normalize_chat(
         {
             "id": str(uuid.uuid4()),
@@ -10531,8 +10952,10 @@ def create_code_chat(
             "updated_at": now_iso(),
         }
     )
-    chats.insert(0, new_chat)
-    save_code_chats(profile["id"], chats)
+    with DATA_LOCK:
+        with db_connect() as conn:
+            scope = ownership_scope_from_profile(profile) or ownership_scope_for_profile(profile["id"], conn)
+            insert_empty_code_chat_row(conn, profile["id"], new_chat, scope)
     return new_chat
 
 
