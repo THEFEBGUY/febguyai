@@ -20,9 +20,10 @@ import uuid
 import zipfile
 import xml.etree.ElementTree as ET
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import urlparse
 
 import requests
@@ -358,6 +359,8 @@ def env_positive_int(name: str, default: int) -> int:
 MAX_REQUEST_MB = max(MAX_UPLOAD_MB + 1, env_positive_int("FEBGUY_MAX_REQUEST_MB", 20))
 MAX_REQUEST_BYTES = MAX_REQUEST_MB * 1024 * 1024
 MAX_MESSAGE_CHARS = env_positive_int("FEBGUY_MAX_MESSAGE_CHARS", 24000)
+STREAM_CHAT_CONTEXT_MESSAGES = env_positive_int("FEBGUY_STREAM_CHAT_CONTEXT_MESSAGES", 14)
+STREAM_CODE_CONTEXT_MESSAGES = env_positive_int("FEBGUY_STREAM_CODE_CONTEXT_MESSAGES", 12)
 MAX_CHAT_TITLE_CHARS = 160
 MAX_CHAT_ID_CHARS = 128
 MAX_PROFILE_NAME_CHARS = 80
@@ -420,6 +423,10 @@ GUEST_DEVICE_SESSION_LOCK = threading.Lock()
 GUEST_USAGE_STATUS_CACHE_SECONDS = 10
 GUEST_USAGE_STATUS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 GUEST_USAGE_STATUS_LOCK = threading.Lock()
+WORKSPACE_CONTEXT_CACHE_SECONDS = 30
+SETTINGS_CACHE: dict[str, dict[str, Any]] = {}
+MEMORY_CACHE: dict[str, dict[str, Any]] = {}
+WORKSPACE_CONTEXT_CACHE_LOCK = threading.Lock()
 TABLE_COLUMN_CACHE: dict[tuple[str, str], set[str]] = {}
 TABLE_COLUMN_LOCK = threading.Lock()
 try:
@@ -903,6 +910,38 @@ def decode_json(raw: str | None, default: Any) -> Any:
         return default
 
 
+def clone_json_compatible(data: Any) -> Any:
+    return json.loads(json.dumps(data))
+
+
+def elapsed_ms(started_at: float) -> float:
+    return (time.perf_counter() - started_at) * 1000
+
+
+def cache_get(cache: dict[str, dict[str, Any]], key: str) -> Any | None:
+    with WORKSPACE_CONTEXT_CACHE_LOCK:
+        cached = cache.get(key)
+        if not cached:
+            return None
+        if time.monotonic() - float(cached.get("checked_at") or 0.0) > WORKSPACE_CONTEXT_CACHE_SECONDS:
+            cache.pop(key, None)
+            return None
+        return clone_json_compatible(cached["value"])
+
+
+def cache_set(cache: dict[str, dict[str, Any]], key: str, value: Any) -> None:
+    with WORKSPACE_CONTEXT_CACHE_LOCK:
+        cache[key] = {
+            "checked_at": time.monotonic(),
+            "value": clone_json_compatible(value),
+        }
+
+
+def cache_clear(cache: dict[str, dict[str, Any]], key: str) -> None:
+    with WORKSPACE_CONTEXT_CACHE_LOCK:
+        cache.pop(key, None)
+
+
 def add_request_db_time(elapsed: float) -> None:
     REQUEST_DB_TIME.set(REQUEST_DB_TIME.get() + elapsed)
     request_id = REQUEST_TIMING_ID.get()
@@ -963,6 +1002,10 @@ class TimedDatabaseConnection:
 
 def db_connect() -> Any:
     return TimedDatabaseConnection(DATABASE.connect())
+
+
+def data_write_lock():
+    return DATA_LOCK if DATABASE.is_sqlite_active() else nullcontext()
 
 
 def postgres_connect():
@@ -2341,6 +2384,170 @@ def is_saved_backend_failure_message(message: dict[str, Any]) -> bool:
     return any(marker in text for marker in failure_markers)
 
 
+def upsert_chat_header_row(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    chat_item: dict[str, Any],
+    scope: dict[str, str | None] | None = None,
+) -> dict[str, Any]:
+    scope = scope or ownership_scope_for_profile(profile_id, conn)
+    ensure_scope_device_row(conn, scope)
+    chat_item = normalize_chat(chat_item)
+    reject_other_owner_id(conn, "chats", chat_item["id"], scope, "chat")
+    conn.execute(
+        """
+        INSERT INTO chats
+            (id, profile_id, user_id, guest_id, device_id, title, summary,
+             last_uploaded_file, pinned, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            profile_id = excluded.profile_id,
+            user_id = excluded.user_id,
+            guest_id = excluded.guest_id,
+            device_id = excluded.device_id,
+            title = excluded.title,
+            summary = excluded.summary,
+            last_uploaded_file = excluded.last_uploaded_file,
+            pinned = excluded.pinned,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            chat_item["id"],
+            profile_id,
+            *owner_values(scope),
+            chat_item["title"],
+            chat_item["summary"],
+            encode_json(chat_item.get("last_uploaded_file")),
+            int(bool(chat_item.get("pinned"))),
+            chat_item["created_at"],
+            chat_item["updated_at"],
+        ),
+    )
+    return chat_item
+
+
+def upsert_code_chat_header_row(
+    conn: sqlite3.Connection,
+    profile_id: str,
+    chat_item: dict[str, Any],
+    scope: dict[str, str | None] | None = None,
+) -> dict[str, Any]:
+    scope = scope or ownership_scope_for_profile(profile_id, conn)
+    ensure_scope_device_row(conn, scope)
+    chat_item = normalize_chat(chat_item)
+    reject_other_owner_id(conn, "code_chats", chat_item["id"], scope, "code chat")
+    conn.execute(
+        """
+        INSERT INTO code_chats
+            (id, profile_id, user_id, guest_id, device_id, title, summary,
+             pinned, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            profile_id = excluded.profile_id,
+            user_id = excluded.user_id,
+            guest_id = excluded.guest_id,
+            device_id = excluded.device_id,
+            title = excluded.title,
+            summary = excluded.summary,
+            pinned = excluded.pinned,
+            created_at = excluded.created_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            chat_item["id"],
+            profile_id,
+            *owner_values(scope),
+            chat_item["title"],
+            chat_item["summary"],
+            int(bool(chat_item.get("pinned"))),
+            chat_item["created_at"],
+            chat_item["updated_at"],
+        ),
+    )
+    return chat_item
+
+
+def append_new_message_rows(
+    conn: sqlite3.Connection,
+    table: str,
+    profile_id: str,
+    chat_id: str,
+    messages: list[dict[str, Any]],
+    loaded_message_ids: Iterable[str],
+    scope: dict[str, str | None],
+) -> None:
+    if table not in {"messages", "code_messages"}:
+        raise ValueError("Unsupported message table.")
+
+    owner_clause, owner_params = owner_where(scope)
+    row = conn.execute(
+        f"""
+        SELECT MAX(sort_order) AS max_sort_order
+        FROM {table}
+        WHERE {owner_clause} AND chat_id = ?
+        """,
+        (*owner_params, chat_id),
+    ).fetchone()
+    max_sort_order = row["max_sort_order"] if row else None
+    next_sort_order = int(max_sort_order) + 1 if max_sort_order is not None else 0
+    loaded_ids = {str(message_id) for message_id in loaded_message_ids if message_id}
+
+    for message in messages:
+        existing_id = str(message.get("id") or "")
+        if existing_id and existing_id in loaded_ids:
+            continue
+
+        payload = message_to_payload(message)
+        if str(payload["id"]) in loaded_ids:
+            continue
+
+        message.clear()
+        message.update(payload)
+        reject_other_owner_id(conn, table, payload["id"], scope, "message")
+        try:
+            conn.execute(
+                f"""
+                INSERT INTO {table}
+                    (id, profile_id, user_id, guest_id, device_id, chat_id,
+                     sort_order, role, text, payload, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    user_id = excluded.user_id,
+                    guest_id = excluded.guest_id,
+                    device_id = excluded.device_id,
+                    chat_id = excluded.chat_id,
+                    sort_order = excluded.sort_order,
+                    role = excluded.role,
+                    text = excluded.text,
+                    payload = excluded.payload,
+                    created_at = excluded.created_at
+                """,
+                (
+                    payload["id"],
+                    profile_id,
+                    *owner_values(scope),
+                    chat_id,
+                    next_sort_order,
+                    payload["role"],
+                    payload.get("text", ""),
+                    encode_json(payload),
+                    payload["created_at"],
+                ),
+            )
+        except Exception as exc:
+            LOGGER.exception(
+                "DB write failed table=%s chat_id=%s role=%s db_hint=%s",
+                table,
+                chat_id,
+                payload.get("role"),
+                database_error_hint(exc),
+            )
+            raise
+        next_sort_order += 1
+
+
 def upsert_chat_row(
     conn: sqlite3.Connection,
     profile_id: str,
@@ -2455,24 +2662,43 @@ def row_to_chat(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     scope: dict[str, str | None] | None = None,
+    message_limit: int | None = None,
 ) -> dict[str, Any]:
     scope = scope or ownership_scope_for_profile(row["profile_id"], conn)
     owner_clause, owner_params = owner_where(scope)
     messages = []
-    for message_row in conn.execute(
-        f"""
-        SELECT payload
-        FROM messages
-        WHERE {owner_clause} AND chat_id = ?
-        ORDER BY sort_order ASC
-        """,
-        (*owner_params, row["id"]),
-    ).fetchall():
+    if message_limit is not None and message_limit > 0:
+        message_rows = conn.execute(
+            f"""
+            SELECT payload
+            FROM (
+                SELECT payload, sort_order
+                FROM messages
+                WHERE {owner_clause} AND chat_id = ?
+                ORDER BY sort_order DESC
+                LIMIT ?
+            ) AS recent_messages
+            ORDER BY sort_order ASC
+            """,
+            (*owner_params, row["id"], int(message_limit)),
+        ).fetchall()
+    else:
+        message_rows = conn.execute(
+            f"""
+            SELECT payload
+            FROM messages
+            WHERE {owner_clause} AND chat_id = ?
+            ORDER BY sort_order ASC
+            """,
+            (*owner_params, row["id"]),
+        ).fetchall()
+
+    for message_row in message_rows:
         payload = decode_json(message_row["payload"], {})
         if isinstance(payload, dict):
             messages.append(payload)
 
-    return normalize_chat(
+    chat_item = normalize_chat(
         {
             "id": row["id"],
             "title": row["title"],
@@ -2499,6 +2725,12 @@ def row_to_chat_metadata(row: sqlite3.Row) -> dict[str, Any]:
             "updated_at": row["updated_at"],
         }
     )
+    if message_limit is not None and message_limit > 0:
+        chat_item["_recent_messages_only"] = True
+        chat_item["_loaded_message_ids"] = [
+            message["id"] for message in chat_item["messages"] if message.get("id")
+        ]
+    return chat_item
 
 
 def upsert_code_chat_row(
@@ -2612,19 +2844,39 @@ def row_to_code_chat(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     scope: dict[str, str | None] | None = None,
+    message_limit: int | None = None,
+    include_project_files: bool = True,
 ) -> dict[str, Any]:
     scope = scope or ownership_scope_for_profile(row["profile_id"], conn)
     owner_clause, owner_params = owner_where(scope)
     messages = []
-    for message_row in conn.execute(
-        f"""
-        SELECT payload
-        FROM code_messages
-        WHERE {owner_clause} AND chat_id = ?
-        ORDER BY sort_order ASC
-        """,
-        (*owner_params, row["id"]),
-    ).fetchall():
+    if message_limit is not None and message_limit > 0:
+        message_rows = conn.execute(
+            f"""
+            SELECT payload
+            FROM (
+                SELECT payload, sort_order
+                FROM code_messages
+                WHERE {owner_clause} AND chat_id = ?
+                ORDER BY sort_order DESC
+                LIMIT ?
+            ) AS recent_code_messages
+            ORDER BY sort_order ASC
+            """,
+            (*owner_params, row["id"], int(message_limit)),
+        ).fetchall()
+    else:
+        message_rows = conn.execute(
+            f"""
+            SELECT payload
+            FROM code_messages
+            WHERE {owner_clause} AND chat_id = ?
+            ORDER BY sort_order ASC
+            """,
+            (*owner_params, row["id"]),
+        ).fetchall()
+
+    for message_row in message_rows:
         payload = decode_json(message_row["payload"], {})
         if isinstance(payload, dict):
             messages.append(payload)
@@ -2640,7 +2892,16 @@ def row_to_code_chat(
             "updated_at": row["updated_at"],
         }
     )
-    chat_item["projectFiles"] = load_code_project_files(row["profile_id"], row["id"], conn, scope)
+    if message_limit is not None and message_limit > 0:
+        chat_item["_recent_messages_only"] = True
+        chat_item["_loaded_message_ids"] = [
+            message["id"] for message in chat_item["messages"] if message.get("id")
+        ]
+    chat_item["projectFiles"] = (
+        load_code_project_files(row["profile_id"], row["id"], conn, scope)
+        if include_project_files
+        else []
+    )
     return chat_item
 
 
@@ -3858,26 +4119,47 @@ def consume_guest_usage(
     period_start_at = datetime.now()
     timestamp = period_start_at.isoformat(timespec="seconds")
     period_end = (period_start_at + timedelta(days=1)).isoformat(timespec="seconds")
-    cache_guest_id: str | None = None
-    with DATA_LOCK:
+    guest_id = profile.get("guest_id")
+    profile_device_id = profile.get("device_id")
+    if guest_id and profile_device_id:
+        if profile_device_id != normalized_device_id:
+            raise HTTPException(status_code=403, detail="This guest session belongs to another device.")
+
+    cached_usage = (
+        cached_guest_usage_status(str(guest_id), normalized_device_id)
+        if guest_id
+        else None
+    )
+    cached_limits = cached_usage.get("limits", {}) if cached_usage else {}
+    for limit_key in requested_keys:
+        cached_limit = cached_limits.get(limit_key)
+        if cached_limit and int(cached_limit.get("remaining", 0)) <= 0:
+            raise HTTPException(status_code=429, detail=GUEST_LIMIT_MESSAGE)
+
+    cache_guest_id: str | None = str(guest_id) if guest_id else None
+    with data_write_lock():
         with db_connect() as conn:
-            guest_row = conn.execute(
-                """
-                SELECT guest_id, device_id
-                FROM guest_sessions
-                WHERE profile_id = ?
-                """,
-                (profile["id"],),
-            ).fetchone()
+            if not guest_id:
+                guest_row = conn.execute(
+                    """
+                    SELECT guest_id, device_id
+                    FROM guest_sessions
+                    WHERE profile_id = ?
+                    """,
+                    (profile["id"],),
+                ).fetchone()
 
-            if not guest_row:
-                raise HTTPException(status_code=401, detail="Guest session could not be verified.")
+                if not guest_row:
+                    raise HTTPException(status_code=401, detail="Guest session could not be verified.")
 
-            if guest_row["device_id"] != normalized_device_id:
-                raise HTTPException(status_code=403, detail="This guest session belongs to another device.")
-            cache_guest_id = guest_row["guest_id"]
+                if guest_row["device_id"] != normalized_device_id:
+                    raise HTTPException(status_code=403, detail="This guest session belongs to another device.")
+                guest_id = guest_row["guest_id"]
+                cache_guest_id = guest_id
 
             for limit_key in requested_keys:
+                if cached_limits.get(limit_key):
+                    continue
                 limit = GUEST_USAGE_LIMITS[limit_key]
                 usage_row = conn.execute(
                     """
@@ -3885,7 +4167,7 @@ def consume_guest_usage(
                     FROM usage_limits
                     WHERE guest_id = ? AND device_id = ? AND limit_key = ?
                     """,
-                    (guest_row["guest_id"], normalized_device_id, limit_key),
+                    (guest_id, normalized_device_id, limit_key),
                 ).fetchone()
                 used_count = int(usage_row["used_count"]) if usage_row else 0
                 if used_count >= limit:
@@ -3896,7 +4178,7 @@ def consume_guest_usage(
                 columns = table_column_names(conn, "usage_limits")
                 insert_values: dict[str, Any] = {
                     "id": str(uuid.uuid4()),
-                    "guest_id": guest_row["guest_id"],
+                    "guest_id": guest_id,
                     "device_id": normalized_device_id,
                     "limit_key": limit_key,
                     "period_start": timestamp,
@@ -4557,10 +4839,16 @@ def load_memory(
     profile_id: str,
     scope: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
+    cached = cache_get(MEMORY_CACHE, profile_id)
+    if cached is not None:
+        return cached
+
     ensure_files()
     with db_connect() as conn:
         scope = scope or ownership_scope_for_profile(profile_id, conn)
-        return row_to_memory(conn, profile_id, scope)
+        memory = row_to_memory(conn, profile_id, scope)
+    cache_set(MEMORY_CACHE, profile_id, memory)
+    return memory
 
 
 def save_memory(profile_id: str, memory: dict[str, Any]) -> dict[str, Any]:
@@ -4568,6 +4856,7 @@ def save_memory(profile_id: str, memory: dict[str, Any]) -> dict[str, Any]:
     with DATA_LOCK:
         with db_connect() as conn:
             upsert_memory_rows(conn, profile_id, normalized)
+    cache_set(MEMORY_CACHE, profile_id, normalized)
     return normalized
 
 
@@ -4575,6 +4864,10 @@ def load_settings(
     profile_id: str,
     scope: dict[str, str | None] | None = None,
 ) -> dict[str, Any]:
+    cached = cache_get(SETTINGS_CACHE, profile_id)
+    if cached is not None:
+        return cached
+
     ensure_files()
     with db_connect() as conn:
         scope = scope or ownership_scope_for_profile(profile_id, conn)
@@ -4583,7 +4876,9 @@ def load_settings(
             f"SELECT * FROM settings WHERE {owner_clause}",
             owner_params,
         ).fetchone()
-    return row_to_settings(row)
+    settings = row_to_settings(row)
+    cache_set(SETTINGS_CACHE, profile_id, settings)
+    return settings
 
 
 def save_settings(profile_id: str, settings: dict[str, Any]) -> dict[str, Any]:
@@ -4592,6 +4887,7 @@ def save_settings(profile_id: str, settings: dict[str, Any]) -> dict[str, Any]:
     with DATA_LOCK:
         with db_connect() as conn:
             upsert_settings_row(conn, profile_id, current)
+    cache_set(SETTINGS_CACHE, profile_id, current)
     return current
 
 
@@ -4667,6 +4963,10 @@ def sort_chats(chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return pinned + unpinned
 
 
+def public_chat_payload(chat_item: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in chat_item.items() if not str(key).startswith("_")}
+
+
 def load_chats(profile_id: str) -> list[dict[str, Any]]:
     ensure_files()
     with db_connect() as conn:
@@ -4683,6 +4983,30 @@ def load_chats(profile_id: str) -> list[dict[str, Any]]:
         ).fetchall()
         chats = [row_to_chat(conn, row, scope) for row in rows]
     return sort_chats(chats)
+
+
+def load_chat_by_id(
+    profile_id: str,
+    chat_id: str,
+    scope: dict[str, str | None] | None = None,
+    message_limit: int | None = None,
+) -> dict[str, Any]:
+    ensure_files()
+    with db_connect() as conn:
+        scope = scope or ownership_scope_for_profile(profile_id, conn)
+        owner_clause, owner_params = owner_where(scope)
+        row = conn.execute(
+            f"""
+            SELECT *
+            FROM chats
+            WHERE {owner_clause} AND id = ?
+            """,
+            (*owner_params, chat_id),
+        ).fetchone()
+        if row:
+            return row_to_chat(conn, row, scope, message_limit=message_limit)
+        reject_other_owner_id(conn, "chats", chat_id, scope, "chat")
+    return normalize_chat({"id": chat_id})
 
 
 def load_chat_metadata(
@@ -4736,11 +5060,30 @@ def save_current_chat(
     current_chat: dict[str, Any],
 ) -> list[dict[str, Any]]:
     current_chat["updated_at"] = now_iso()
-    without_current = [
-        chat_item for chat_item in chats if chat_item["id"] != current_chat["id"]
-    ]
-    without_current.insert(0, normalize_chat(current_chat))
-    return save_chats(profile_id, without_current)
+    recent_only = bool(current_chat.get("_recent_messages_only"))
+    loaded_message_ids = current_chat.get("_loaded_message_ids") or []
+    with data_write_lock():
+        with db_connect() as conn:
+            scope = ownership_scope_for_profile(profile_id, conn)
+            if recent_only:
+                saved_chat = upsert_chat_header_row(conn, profile_id, current_chat, scope)
+                append_new_message_rows(
+                    conn,
+                    "messages",
+                    profile_id,
+                    saved_chat["id"],
+                    saved_chat["messages"],
+                    loaded_message_ids,
+                    scope,
+                )
+                current_chat.update(saved_chat)
+                current_chat["_recent_messages_only"] = True
+                current_chat["_loaded_message_ids"] = [
+                    message["id"] for message in saved_chat["messages"] if message.get("id")
+                ]
+            else:
+                upsert_chat_row(conn, profile_id, current_chat, scope)
+    return load_chat_metadata(profile_id)
 
 
 def load_code_chats(profile_id: str) -> list[dict[str, Any]]:
@@ -4759,6 +5102,39 @@ def load_code_chats(profile_id: str) -> list[dict[str, Any]]:
         ).fetchall()
         chats = [row_to_code_chat(conn, row, scope) for row in rows]
     return sort_chats(chats)
+
+
+def load_code_chat_by_id(
+    profile_id: str,
+    chat_id: str,
+    scope: dict[str, str | None] | None = None,
+    message_limit: int | None = None,
+    include_project_files: bool = True,
+) -> dict[str, Any]:
+    ensure_files()
+    with db_connect() as conn:
+        scope = scope or ownership_scope_for_profile(profile_id, conn)
+        owner_clause, owner_params = owner_where(scope)
+        row = conn.execute(
+            f"""
+            SELECT *
+            FROM code_chats
+            WHERE {owner_clause} AND id = ?
+            """,
+            (*owner_params, chat_id),
+        ).fetchone()
+        if row:
+            return row_to_code_chat(
+                conn,
+                row,
+                scope,
+                message_limit=message_limit,
+                include_project_files=include_project_files,
+            )
+        reject_other_owner_id(conn, "code_chats", chat_id, scope, "code chat")
+    new_chat = normalize_chat({"id": chat_id, "title": "New Code Chat"})
+    new_chat["projectFiles"] = []
+    return new_chat
 
 
 def load_code_chat_metadata(
@@ -4823,11 +5199,31 @@ def save_current_code_chat(
     current_chat: dict[str, Any],
 ) -> list[dict[str, Any]]:
     current_chat["updated_at"] = now_iso()
-    without_current = [
-        chat_item for chat_item in chats if chat_item["id"] != current_chat["id"]
-    ]
-    without_current.insert(0, normalize_chat(current_chat))
-    return save_code_chats(profile_id, without_current)
+    recent_only = bool(current_chat.get("_recent_messages_only"))
+    loaded_message_ids = current_chat.get("_loaded_message_ids") or []
+    with data_write_lock():
+        with db_connect() as conn:
+            scope = ownership_scope_for_profile(profile_id, conn)
+            if recent_only:
+                saved_chat = upsert_code_chat_header_row(conn, profile_id, current_chat, scope)
+                append_new_message_rows(
+                    conn,
+                    "code_messages",
+                    profile_id,
+                    saved_chat["id"],
+                    saved_chat["messages"],
+                    loaded_message_ids,
+                    scope,
+                )
+                current_chat.update(saved_chat)
+                current_chat["_recent_messages_only"] = True
+                current_chat["_loaded_message_ids"] = [
+                    message["id"] for message in saved_chat["messages"] if message.get("id")
+                ]
+                current_chat["projectFiles"] = current_chat.get("projectFiles", [])
+            else:
+                upsert_code_chat_row(conn, profile_id, current_chat, scope)
+    return load_code_chat_metadata(profile_id)
 
 
 def safe_code_file_name(raw_name: str | None, fallback: str = "code.txt") -> str:
@@ -5097,6 +5493,35 @@ def build_code_project_context(profile_id: str, chat_id: str, user_message: str)
         )
 
     return "\n".join(sections), selected
+
+
+def should_load_code_project_context(
+    message: str,
+    task: str,
+    saved_project_files: list[dict[str, Any]],
+) -> bool:
+    if saved_project_files or extract_referenced_code_file_names(message):
+        return True
+
+    text = f" {message.lower()} "
+    project_terms = (
+        " project ",
+        " codebase ",
+        " repo ",
+        " repository ",
+        " files ",
+        " file ",
+        " component ",
+        " app ",
+        " current code ",
+        " existing code ",
+        " my code ",
+        " this code ",
+    )
+    if any(term in text for term in project_terms):
+        return True
+
+    return task in {"debug", "diff", "test", "readme", "optimize", "convert"}
 
 
 def infer_generated_file_name(prefix: str, language: str, index: int, user_message: str = "") -> str:
@@ -5476,8 +5901,12 @@ def search_document_chunks_db(
     return search_document_chunks(query, chunks, limit=limit)
 
 
-def update_memory_from_message(profile_id: str, message: str) -> dict[str, Any]:
-    memory = load_memory(profile_id)
+def update_memory_from_message(
+    profile_id: str,
+    message: str,
+    scope: dict[str, str | None] | None = None,
+) -> dict[str, Any]:
+    memory = load_memory(profile_id, scope)
     message_clean = re.sub(r"\s+", " ", message).strip()
     message_lower = message_clean.lower()
     changed = False
@@ -9924,6 +10353,70 @@ def create_fast_title_from_message(message: str) -> str:
     return title.title() if title else "New Chat"
 
 
+def stream_timing_metrics() -> dict[str, Any]:
+    return {
+        "started_at": time.perf_counter(),
+        "prepare_ms": 0.0,
+        "context_ms": 0.0,
+        "db_ms": 0.0,
+        "ai_first_token_ms": None,
+        "ai_total_ms": 0.0,
+        "persist_ms": 0.0,
+    }
+
+
+def mark_stream_first_token(metrics: dict[str, Any]) -> None:
+    if metrics.get("ai_first_token_ms") is None:
+        metrics["ai_first_token_ms"] = elapsed_ms(metrics["started_at"])
+
+
+def current_stream_db_ms() -> float:
+    request_id = REQUEST_TIMING_ID.get()
+    if request_id:
+        with REQUEST_TIMING_LOCK:
+            totals = REQUEST_TIMING_TOTALS.get(request_id)
+            if totals is not None:
+                return float(totals.get("db") or 0.0) * 1000
+    return REQUEST_DB_TIME.get() * 1000
+
+
+def capture_stream_db_ms(metrics: dict[str, Any]) -> None:
+    metrics["db_ms"] = max(
+        float(metrics.get("db_ms") or 0.0),
+        current_stream_db_ms(),
+    )
+
+
+def finish_stream_persistence(metrics: dict[str, Any], persist_started: float) -> None:
+    metrics["persist_ms"] = elapsed_ms(persist_started)
+    metrics["db_ms"] = float(metrics.get("db_ms") or 0.0) + current_stream_db_ms()
+
+
+def start_stream_persistence_thread(metrics: dict[str, Any], target: Callable[[], None]) -> None:
+    capture_stream_db_ms(metrics)
+    threading.Thread(target=target, daemon=True).start()
+
+
+def log_stream_timing(endpoint: str, metrics: dict[str, Any]) -> None:
+    first_token = metrics.get("ai_first_token_ms")
+    db_ms = max(float(metrics.get("db_ms") or 0.0), current_stream_db_ms())
+    LOGGER.info(
+        (
+            "stream_timing endpoint=%s prepare_ms=%.1f context_ms=%.1f "
+            "db_ms=%.1f ai_first_token_ms=%s ai_total_ms=%.1f "
+            "persist_ms=%.1f total_ms=%.1f"
+        ),
+        endpoint,
+        float(metrics.get("prepare_ms") or 0.0),
+        float(metrics.get("context_ms") or 0.0),
+        db_ms,
+        f"{float(first_token):.1f}" if first_token is not None else "n/a",
+        float(metrics.get("ai_total_ms") or 0.0),
+        float(metrics.get("persist_ms") or 0.0),
+        elapsed_ms(metrics["started_at"]),
+    )
+
+
 def persist_ai_response(
     profile_id: str,
     chats: list[dict[str, Any]],
@@ -10075,7 +10568,7 @@ def save_document_not_available_response(
     )
     return {
         "response": response_text,
-        "chat": current_chat,
+        "chat": public_chat_payload(current_chat),
         "chats": saved_chats,
         "searchUsed": False,
         "citations": [],
@@ -10095,6 +10588,7 @@ async def prepare_chat(
     file: UploadFile | None,
     validated_upload: tuple[str, str, bytes] | None = None,
     replace_last_turn: bool = False,
+    metrics: dict[str, Any] | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     dict[str, Any],
@@ -10110,10 +10604,12 @@ async def prepare_chat(
     dict[str, Any],
 ]:
     profile_id = profile["id"]
-    chats = load_chats(profile_id)
-    current_chat = get_current_chat(chats, chat_id)
+    scope = ownership_scope_from_profile(profile)
+    message_limit = None if replace_last_turn else STREAM_CHAT_CONTEXT_MESSAGES
+    current_chat = load_chat_by_id(profile_id, chat_id, scope, message_limit=message_limit)
+    chats = [current_chat]
     user_message = (message or "").strip()
-    settings = load_settings(profile_id)
+    settings = load_settings(profile_id, scope)
 
     if replace_last_turn:
         remove_latest_turn_for_retry(current_chat)
@@ -10124,7 +10620,7 @@ async def prepare_chat(
     if not user_message:
         user_message = "Hello"
 
-    memory = update_memory_from_message(profile_id, user_message)
+    memory = update_memory_from_message(profile_id, user_message, scope)
     uploaded_file = None
 
     if file:
@@ -10135,7 +10631,7 @@ async def prepare_chat(
             validated_upload,
         )
         current_chat["last_uploaded_file"] = uploaded_file
-        log_activity(
+        log_activity_async(
             profile_id,
             "file_uploaded",
             {
@@ -10145,6 +10641,7 @@ async def prepare_chat(
             },
         )
 
+    context_started = time.perf_counter()
     active_file = current_chat.get("last_uploaded_file")
     document_result = None
 
@@ -10157,6 +10654,8 @@ async def prepare_chat(
         )
 
     if document_result is not None:
+        if metrics is not None:
+            metrics["context_ms"] = metrics.get("context_ms", 0.0) + elapsed_ms(context_started)
         return (
             chats,
             current_chat,
@@ -10186,6 +10685,8 @@ async def prepare_chat(
         has_file_context=bool(file_context),
         settings=settings,
     )
+    if metrics is not None:
+        metrics["context_ms"] = metrics.get("context_ms", 0.0) + elapsed_ms(context_started)
 
     return (
         chats,
@@ -10986,7 +11487,7 @@ def update_chat(
         chat_item["pinned"] = data.pinned
 
     saved = save_current_chat(profile["id"], chats, chat_item)
-    return {"chat": chat_item, "chats": saved}
+    return {"chat": public_chat_payload(chat_item), "chats": saved}
 
 
 @app.delete("/chats/{chat_id}")
@@ -11004,6 +11505,19 @@ def delete_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[
     return {"chats": load_chats(profile["id"])}
 
 
+@app.get("/chats/{chat_id}")
+def get_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[str, Any]:
+    profile = require_workspace_session(authorization)
+    chat_id = validate_chat_id(chat_id)
+    return {
+        "chat": load_chat_by_id(
+            profile["id"],
+            chat_id,
+            ownership_scope_from_profile(profile),
+        )
+    }
+
+
 @app.post("/chats/{chat_id}/clear")
 def clear_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[str, Any]:
     profile = require_workspace_session(authorization)
@@ -11014,7 +11528,7 @@ def clear_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[s
     chat_item["summary"] = ""
     chat_item["last_uploaded_file"] = None
     saved = save_current_chat(profile["id"], chats, chat_item)
-    return {"chat": chat_item, "chats": saved}
+    return {"chat": public_chat_payload(chat_item), "chats": saved}
 
 
 @app.get("/chats/{chat_id}/export")
@@ -11099,6 +11613,19 @@ def delete_code_chat(chat_id: str, authorization: str | None = Header(None)) -> 
     return {"chats": load_code_chats(profile["id"])}
 
 
+@app.get("/code/chats/{chat_id}")
+def get_code_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[str, Any]:
+    profile = require_workspace_session(authorization)
+    chat_id = validate_chat_id(chat_id)
+    return {
+        "chat": load_code_chat_by_id(
+            profile["id"],
+            chat_id,
+            ownership_scope_from_profile(profile),
+        )
+    }
+
+
 @app.get("/code/chats/{chat_id}/export")
 def export_code_chat(chat_id: str, authorization: str | None = Header(None)):
     profile = require_workspace_session(authorization)
@@ -11131,6 +11658,7 @@ async def code_chat_stream(
     authorization: str | None = Header(None),
     x_febguy_device_id: str | None = Header(None, alias=DEVICE_ID_HEADER),
 ):
+    metrics = stream_timing_metrics()
     _device_id = resolve_device_id(device_id, x_febguy_device_id)
     profile = require_workspace_session(authorization)
     enforce_rate_limit(request, "ai", profile)
@@ -11146,10 +11674,17 @@ async def code_chat_stream(
     validated_code_uploads = [await validate_code_context_upload(item) for item in incoming_files]
     consume_guest_usage(profile, _device_id, "code", *(("upload",) if validated_code_uploads else ()))
     profile_id = profile["id"]
-    assert_chat_owner_or_new(profile_id, chat_id, code=True)
+    scope = ownership_scope_from_profile(profile)
     user_message = (message or "").strip() or "Help me write code."
-    chats = load_code_chats(profile_id)
-    current_chat = get_current_code_chat(chats, chat_id)
+    message_limit = None if replace_last_turn else STREAM_CODE_CONTEXT_MESSAGES
+    current_chat = load_code_chat_by_id(
+        profile_id,
+        chat_id,
+        scope,
+        message_limit=message_limit,
+        include_project_files=False,
+    )
+    chats = [current_chat]
     if replace_last_turn:
         remove_latest_turn_for_retry(current_chat)
     pasted_code_files = extract_pasted_code_files(user_message)
@@ -11173,6 +11708,7 @@ async def code_chat_stream(
     append_user_message(current_chat, user_message, None)
     if saved_project_files:
         current_chat["messages"][-1]["codeFiles"] = saved_project_files
+    metrics["prepare_ms"] = elapsed_ms(metrics["started_at"])
     if is_code_context_only_message(user_message, saved_project_files):
         quick_reply = (
             f"Added {len(saved_project_files)} code file"
@@ -11181,6 +11717,7 @@ async def code_chat_stream(
         )
 
         def context_saved_stream():
+            mark_stream_first_token(metrics)
             yield quick_reply
             meta = {
                 "codeTask": "project_context",
@@ -11189,21 +11726,26 @@ async def code_chat_stream(
                 "projectFiles": saved_project_files,
             }
             yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
-            threading.Thread(
-                target=persist_code_response,
-                args=(
-                    profile_id,
-                    chats,
-                    current_chat,
-                    user_message,
-                    quick_reply,
-                    "project_context",
-                    "auto",
-                    saved_project_files,
-                    [],
-                ),
-                daemon=True,
-            ).start()
+
+            def persist_and_log() -> None:
+                persist_started = time.perf_counter()
+                try:
+                    persist_code_response(
+                        profile_id,
+                        chats,
+                        current_chat,
+                        user_message,
+                        quick_reply,
+                        "project_context",
+                        "auto",
+                        saved_project_files,
+                        [],
+                    )
+                finally:
+                    finish_stream_persistence(metrics, persist_started)
+                    log_stream_timing("/code-chat-stream", metrics)
+
+            start_stream_persistence_thread(metrics, persist_and_log)
 
         return StreamingResponse(
             context_saved_stream(),
@@ -11218,6 +11760,7 @@ async def code_chat_stream(
         language = "auto"
 
         def quick_response_stream():
+            mark_stream_first_token(metrics)
             yield quick_reply
             meta = {
                 "codeTask": task,
@@ -11226,11 +11769,26 @@ async def code_chat_stream(
                 "projectFiles": saved_project_files,
             }
             yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
-            threading.Thread(
-                target=persist_code_response,
-                args=(profile_id, chats, current_chat, user_message, quick_reply, task, language, saved_project_files, []),
-                daemon=True,
-            ).start()
+
+            def persist_and_log() -> None:
+                persist_started = time.perf_counter()
+                try:
+                    persist_code_response(
+                        profile_id,
+                        chats,
+                        current_chat,
+                        user_message,
+                        quick_reply,
+                        task,
+                        language,
+                        saved_project_files,
+                        [],
+                    )
+                finally:
+                    finish_stream_persistence(metrics, persist_started)
+                    log_stream_timing("/code-chat-stream", metrics)
+
+            start_stream_persistence_thread(metrics, persist_and_log)
 
         return StreamingResponse(
             quick_response_stream(),
@@ -11240,13 +11798,19 @@ async def code_chat_stream(
 
     task = detect_code_task(user_message)
     language = detect_code_language(user_message)
-    project_context, selected_project_files = build_code_project_context(profile_id, chat_id, user_message)
+    project_context = ""
+    selected_project_files: list[dict[str, Any]] = []
+    if should_load_code_project_context(user_message, task, saved_project_files):
+        context_started = time.perf_counter()
+        project_context, selected_project_files = build_code_project_context(profile_id, chat_id, user_message)
+        metrics["context_ms"] = elapsed_ms(context_started)
     relevant_project_files = selected_project_files or saved_project_files
-    log_activity(profile_id, "code_request", {"task": task, "language": language})
+    log_activity_async(profile_id, "code_request", {"task": task, "language": language})
     clarification = code_clarification_response(user_message, task, has_project_context=bool(relevant_project_files))
 
     if clarification:
         def clarification_response_stream():
+            mark_stream_first_token(metrics)
             yield clarification
             meta = {
                 "codeTask": task,
@@ -11255,11 +11819,26 @@ async def code_chat_stream(
                 "projectFiles": relevant_project_files,
             }
             yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
-            threading.Thread(
-                target=persist_code_response,
-                args=(profile_id, chats, current_chat, user_message, clarification, task, language, relevant_project_files, []),
-                daemon=True,
-            ).start()
+
+            def persist_and_log() -> None:
+                persist_started = time.perf_counter()
+                try:
+                    persist_code_response(
+                        profile_id,
+                        chats,
+                        current_chat,
+                        user_message,
+                        clarification,
+                        task,
+                        language,
+                        relevant_project_files,
+                        [],
+                    )
+                finally:
+                    finish_stream_persistence(metrics, persist_started)
+                    log_stream_timing("/code-chat-stream", metrics)
+
+            start_stream_persistence_thread(metrics, persist_and_log)
 
         return StreamingResponse(
             clarification_response_stream(),
@@ -11267,14 +11846,18 @@ async def code_chat_stream(
             headers=STREAM_RESPONSE_HEADERS,
         )
 
+    metrics["prepare_ms"] = elapsed_ms(metrics["started_at"])
     prompt, task, language = build_code_prompt(user_message, current_chat, profile, answer_length, project_context)
 
     def response_stream():
         ai_text = ""
+        ai_started = time.perf_counter()
 
         for chunk in stream_text_model(prompt, model=CODE_MODEL):
             ai_text += chunk
+            mark_stream_first_token(metrics)
             yield chunk
+        metrics["ai_total_ms"] = elapsed_ms(ai_started)
 
         final_text = ai_text.strip() or "I could not generate a coding response."
         meta = {
@@ -11287,21 +11870,26 @@ async def code_chat_stream(
         if generated_files:
             meta["generatedFiles"] = generated_files
         yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
-        threading.Thread(
-            target=persist_code_response,
-            args=(
-                profile_id,
-                chats,
-                current_chat,
-                user_message,
-                final_text,
-                task,
-                language,
-                relevant_project_files,
-                generated_files,
-            ),
-            daemon=True,
-        ).start()
+
+        def persist_and_log() -> None:
+            persist_started = time.perf_counter()
+            try:
+                persist_code_response(
+                    profile_id,
+                    chats,
+                    current_chat,
+                    user_message,
+                    final_text,
+                    task,
+                    language,
+                    relevant_project_files,
+                    generated_files,
+                )
+            finally:
+                finish_stream_persistence(metrics, persist_started)
+                log_stream_timing("/code-chat-stream", metrics)
+
+        start_stream_persistence_thread(metrics, persist_and_log)
 
     return StreamingResponse(
         response_stream(),
@@ -11427,7 +12015,7 @@ async def chat(
         )
         return {
             "response": clarification,
-            "chat": current_chat,
+            "chat": public_chat_payload(current_chat),
             "chats": saved_chats,
             "intent": intent,
             "answerMode": answer_mode,
@@ -11449,7 +12037,7 @@ async def chat(
         )
         return {
             "response": direct_response,
-            "chat": current_chat,
+            "chat": public_chat_payload(current_chat),
             "chats": saved_chats,
             "intent": intent,
             "answerMode": answer_mode,
@@ -11501,7 +12089,7 @@ async def chat(
 
     return {
         "response": ai_response,
-        "chat": current_chat,
+        "chat": public_chat_payload(current_chat),
         "chats": saved_chats,
         "searchUsed": bool(search_context),
         "citations": citations,
@@ -11671,7 +12259,7 @@ async def voice_chat(
     return {
         "transcript": transcript,
         "response": ai_response,
-        "chat": current_chat,
+        "chat": public_chat_payload(current_chat),
         "chats": saved_chats,
         "searchUsed": bool(search_context),
         "citations": citations,
@@ -11698,6 +12286,7 @@ async def chat_stream(
     authorization: str | None = Header(None),
     x_febguy_device_id: str | None = Header(None, alias=DEVICE_ID_HEADER),
 ):
+    metrics = stream_timing_metrics()
     _device_id = resolve_device_id(device_id, x_febguy_device_id)
     profile = require_workspace_session(authorization)
     enforce_rate_limit(request, "ai", profile)
@@ -11726,31 +12315,40 @@ async def chat_stream(
         document_hits,
         search_context,
         research,
-    ) = await prepare_chat(profile, chat_id, message, file, validated_upload, replace_last_turn)
+    ) = await prepare_chat(profile, chat_id, message, file, validated_upload, replace_last_turn, metrics)
+    metrics["prepare_ms"] = elapsed_ms(metrics["started_at"])
 
     if search_context.startswith("__DOCUMENT_TOOL__"):
         document_result = json.loads(search_context.replace("__DOCUMENT_TOOL__", "", 1))
+        persist_started = time.perf_counter()
+        response_payload = save_document_response(
+            profile_id,
+            chats,
+            current_chat,
+            user_message,
+            uploaded_file,
+            document_result,
+        )
+        metrics["persist_ms"] = elapsed_ms(persist_started)
+        log_stream_timing("/chat-stream", metrics)
         return JSONResponse(
-            save_document_response(
-                profile_id,
-                chats,
-                current_chat,
-                user_message,
-                uploaded_file,
-                document_result,
-            )
+            response_payload
         )
 
     if file_context.startswith(DOCUMENT_NOT_IN_CHAT_PREFIX):
+        persist_started = time.perf_counter()
+        response_payload = save_document_not_available_response(
+            profile_id,
+            chats,
+            current_chat,
+            user_message,
+            uploaded_file,
+            file_context.replace(DOCUMENT_NOT_IN_CHAT_PREFIX, "", 1),
+        )
+        metrics["persist_ms"] = elapsed_ms(persist_started)
+        log_stream_timing("/chat-stream", metrics)
         return JSONResponse(
-            save_document_not_available_response(
-                profile_id,
-                chats,
-                current_chat,
-                user_message,
-                uploaded_file,
-                file_context.replace(DOCUMENT_NOT_IN_CHAT_PREFIX, "", 1),
-            )
+            response_payload
         )
 
     conversation = classify_conversation(
@@ -11775,7 +12373,7 @@ async def chat_stream(
         conversation=conversation,
     )
     answer_mode = route["answerMode"]
-    log_activity(profile_id, "chat_stream_request", {"intent": intent, "mode": answer_mode, "tool": route["tool"]})
+    log_activity_async(profile_id, "chat_stream_request", {"intent": intent, "mode": answer_mode, "tool": route["tool"]})
     has_history = bool(current_chat.get("messages"))
     clarification = clarification_response(
         user_message,
@@ -11793,6 +12391,7 @@ async def chat_stream(
     append_user_message(current_chat, user_message, uploaded_file)
 
     if clarification:
+        persist_started = time.perf_counter()
         saved_chats = persist_ai_response(
             profile_id,
             chats,
@@ -11803,10 +12402,12 @@ async def chat_stream(
             use_llm_title=False,
             update_summary=False,
         )
+        metrics["persist_ms"] = elapsed_ms(persist_started)
+        log_stream_timing("/chat-stream", metrics)
         return JSONResponse(
             {
                 "response": clarification,
-                "chat": current_chat,
+                "chat": public_chat_payload(current_chat),
                 "chats": saved_chats,
                 "intent": intent,
                 "answerMode": answer_mode,
@@ -11817,6 +12418,7 @@ async def chat_stream(
 
     direct_response = direct_tool_response(user_message, current_chat, conversation)
     if direct_response:
+        persist_started = time.perf_counter()
         saved_chats = persist_ai_response(
             profile_id,
             chats,
@@ -11827,10 +12429,12 @@ async def chat_stream(
             use_llm_title=False,
             update_summary=False,
         )
+        metrics["persist_ms"] = elapsed_ms(persist_started)
+        log_stream_timing("/chat-stream", metrics)
         return JSONResponse(
             {
                 "response": direct_response,
-                "chat": current_chat,
+                "chat": public_chat_payload(current_chat),
                 "chats": saved_chats,
                 "intent": intent,
                 "answerMode": answer_mode,
@@ -11865,10 +12469,13 @@ async def chat_stream(
 
     def response_stream():
         ai_text = ""
+        ai_started = time.perf_counter()
 
         for chunk in stream_text_model(prompt, model=model, images=image_payloads or None):
             ai_text += chunk
+            mark_stream_first_token(metrics)
             yield chunk
+        metrics["ai_total_ms"] = elapsed_ms(ai_started)
 
         final_text = ai_text.strip() or "I could not generate a response."
         meta = {
@@ -11881,16 +12488,25 @@ async def chat_stream(
             "suggestions": suggestions,
         }
         yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
-        threading.Thread(
-            target=persist_ai_response,
-            args=(profile_id, chats, current_chat, user_message, final_text),
-            kwargs={
-                "citations": citations,
-                "document_hits": document_hits,
-                "suggestions": suggestions,
-            },
-            daemon=True,
-        ).start()
+
+        def persist_and_log() -> None:
+            persist_started = time.perf_counter()
+            try:
+                persist_ai_response(
+                    profile_id,
+                    chats,
+                    current_chat,
+                    user_message,
+                    final_text,
+                    citations=citations,
+                    document_hits=document_hits,
+                    suggestions=suggestions,
+                )
+            finally:
+                finish_stream_persistence(metrics, persist_started)
+                log_stream_timing("/chat-stream", metrics)
+
+        start_stream_persistence_thread(metrics, persist_and_log)
 
     return StreamingResponse(
         response_stream(),

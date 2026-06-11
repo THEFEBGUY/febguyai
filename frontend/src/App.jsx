@@ -559,6 +559,7 @@ function App() {
   const activeRequestControllerRef = useRef(null);
   const activeStreamReaderRef = useRef(null);
   const stoppedStreamReaderRef = useRef(null);
+  const chatDetailRequestRef = useRef({ chat: "", code: "" });
   const copiedStateTimerRef = useRef(null);
   const speechRequestRef = useRef(0);
 
@@ -601,6 +602,13 @@ function App() {
     } else {
       setChats(updater);
     }
+  }, []);
+
+  const mergePendingChats = useCallback((serverChats, currentChats) => {
+    const nextChats = serverChats || [];
+    const serverIds = new Set(nextChats.map(item => item.id));
+    const pendingChats = (currentChats || []).filter(item => item.pending && !serverIds.has(item.id));
+    return [...pendingChats, ...nextChats];
   }, []);
 
   const setWorkspaceActiveId = useCallback((targetWorkspace, value) => {
@@ -652,15 +660,17 @@ function App() {
 
   const refreshChatsList = useCallback(async (tokenOverride) => {
     const data = await requestJson("/chats", {}, tokenOverride);
-    setChats(data.chats || []);
+    const loadedChats = data.chats || [];
+    setChats(prev => mergePendingChats(loadedChats, prev));
     return data.chats || [];
-  }, [requestJson]);
+  }, [mergePendingChats, requestJson]);
 
   const refreshCodeChatsList = useCallback(async (tokenOverride) => {
     const data = await requestJson("/code/chats", {}, tokenOverride);
-    setCodeChats(data.chats || []);
+    const loadedChats = data.chats || [];
+    setCodeChats(prev => mergePendingChats(loadedChats, prev));
     return data.chats || [];
-  }, [requestJson]);
+  }, [mergePendingChats, requestJson]);
 
   const loadMemory = useCallback(async (tokenOverride) => {
     const data = await requestJson("/memory", {}, tokenOverride);
@@ -1464,6 +1474,15 @@ function App() {
     return newChat;
   };
 
+  const loadChatDetail = async (targetWorkspace, chatId) => {
+    if (!chatId) {
+      return null;
+    }
+    const prefix = targetWorkspace === "code" ? "/code" : "";
+    const data = await requestJson(`${prefix}/chats/${chatId}`);
+    return data.chat || null;
+  };
+
   const createNewChat = async () => {
     try {
       const targetWorkspace = workspace;
@@ -1482,9 +1501,10 @@ function App() {
     }
   };
 
-  const openChat = (chatItem) => {
-    setWorkspaceActiveId(workspace, chatItem.id);
-    setWorkspaceMessages(workspace, chatItem.messages || []);
+  const openChat = async (chatItem) => {
+    const targetWorkspace = workspace;
+    setWorkspaceActiveId(targetWorkspace, chatItem.id);
+    setWorkspaceMessages(targetWorkspace, chatItem.messages || []);
     setMessage("");
     setEditingTurn(null);
     setMessageActionMenuKey("");
@@ -1492,6 +1512,28 @@ function App() {
     setDocumentsDrawer(null);
     setAppError("");
     resetFileInput();
+    if (chatItem.pending) {
+      return;
+    }
+    chatDetailRequestRef.current[targetWorkspace] = chatItem.id;
+    try {
+      const loadedChat = await loadChatDetail(targetWorkspace, chatItem.id);
+      if (!loadedChat || chatDetailRequestRef.current[targetWorkspace] !== chatItem.id) {
+        return;
+      }
+      setWorkspaceChats(targetWorkspace, prev => {
+        const found = prev.some(item => item.id === loadedChat.id);
+        if (!found) {
+          return [loadedChat, ...prev];
+        }
+        return prev.map(item => item.id === loadedChat.id ? { ...item, ...loadedChat } : item);
+      });
+      setWorkspaceMessages(targetWorkspace, loadedChat.messages || []);
+    } catch {
+      if (chatDetailRequestRef.current[targetWorkspace] === chatItem.id) {
+        setAppError("Could not load this chat.");
+      }
+    }
   };
 
   const switchWorkspace = (nextWorkspace) => {
@@ -1976,7 +2018,7 @@ function App() {
 
   const updateChatsFromPayload = (payload, targetWorkspace = workspace) => {
     if (payload.chats) {
-      setWorkspaceChats(targetWorkspace, payload.chats);
+      setWorkspaceChats(targetWorkspace, prev => mergePendingChats(payload.chats, prev));
       return;
     }
 
@@ -2167,11 +2209,10 @@ function App() {
       }
     }
 
-    if (targetWorkspace === "code") {
-      await refreshCodeChatsList();
-    } else {
-      await refreshChatsList();
-    }
+    window.setTimeout(() => {
+      const refresh = targetWorkspace === "code" ? refreshCodeChatsList : refreshChatsList;
+      refresh().catch(() => {});
+    }, 650);
     return finalState.displayText;
   };
 
@@ -2212,8 +2253,20 @@ function App() {
     let currentChatId = isCode ? activeCodeChatId : activeChatId;
 
     if (!currentChatId) {
-      const newChat = await createChatOnBackend(targetWorkspace);
-      currentChatId = newChat.id;
+      currentChatId = generateDeviceId();
+      const timestamp = new Date().toISOString();
+      const newChat = {
+        id: currentChatId,
+        title: isCode ? "New Code Chat" : "New Chat",
+        summary: "",
+        messages: [],
+        projectFiles: isCode ? [] : undefined,
+        pinned: false,
+        pending: true,
+        created_at: timestamp,
+        updated_at: timestamp
+      };
+      setWorkspaceChats(targetWorkspace, prev => [newChat, ...prev]);
       setWorkspaceActiveId(targetWorkspace, currentChatId);
     }
 
