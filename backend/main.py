@@ -103,10 +103,10 @@ except ValueError:
 try:
     POSTGRES_POOL_MAX_SIZE = max(
         1,
-        int(os.getenv("POSTGRES_POOL_MAX_SIZE", "5") or "5"),
+        int(os.getenv("POSTGRES_POOL_MAX_SIZE", "8") or "8"),
     )
 except ValueError:
-    POSTGRES_POOL_MAX_SIZE = 5
+    POSTGRES_POOL_MAX_SIZE = 8
 try:
     POSTGRES_POOL_TIMEOUT = max(
         1,
@@ -417,6 +417,9 @@ SESSION_ACCESS_CACHE: dict[str, dict[str, Any]] = {}
 SESSION_ACCESS_LOCK = threading.Lock()
 GUEST_DEVICE_SESSION_CACHE: dict[str, dict[str, Any]] = {}
 GUEST_DEVICE_SESSION_LOCK = threading.Lock()
+GUEST_USAGE_STATUS_CACHE_SECONDS = 10
+GUEST_USAGE_STATUS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+GUEST_USAGE_STATUS_LOCK = threading.Lock()
 TABLE_COLUMN_CACHE: dict[tuple[str, str], set[str]] = {}
 TABLE_COLUMN_LOCK = threading.Lock()
 try:
@@ -3655,13 +3658,15 @@ def create_or_load_guest_session(device_id: str | None) -> dict[str, Any]:
         return cached_response
 
     ensure_files()
-    session_token = secrets.token_urlsafe(32)
+    session_token = ""
     timestamp = now_iso()
     profile: dict[str, Any] | None = None
+    scope: dict[str, str | None] | None = None
     guest_id = ""
     profile_id = ""
     old_session_token: str | None = None
     created_profile = False
+    reused_existing_session = False
 
     try:
         with DATA_LOCK:
@@ -3694,14 +3699,16 @@ def create_or_load_guest_session(device_id: str | None) -> dict[str, Any]:
                         profile = row_to_profile(profile_row)
                         guest_id = guest_row["guest_id"]
                         profile_id = guest_row["profile_id"]
-                        conn.execute(
+                        if old_session_token and conn.execute(
                             """
-                            UPDATE profiles
-                            SET last_login_at = ?, device_id = ?
-                            WHERE id = ?
+                            SELECT token
+                            FROM sessions
+                            WHERE token = ? AND profile_id = ?
                             """,
-                            (timestamp, normalized_device_id, profile_id),
-                        )
+                            (old_session_token, profile_id),
+                        ).fetchone():
+                            session_token = old_session_token
+                            reused_existing_session = True
                     else:
                         conn.execute(
                             "DELETE FROM guest_sessions WHERE device_id = ?",
@@ -3745,117 +3752,51 @@ def create_or_load_guest_session(device_id: str | None) -> dict[str, Any]:
                         ),
                     )
 
-                upsert_session_row(
-                    conn,
-                    token=session_token,
-                    profile_id=profile_id,
-                    mode="guest",
-                    guest_id=guest_id,
-                    device_id=normalized_device_id,
-                    created_at=timestamp,
-                    last_seen_at=timestamp,
-                )
-                conn.execute(
-                    """
-                    INSERT INTO guest_sessions
-                        (guest_id, device_id, profile_id, session_token, created_at, last_seen_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(device_id) DO UPDATE SET
-                        guest_id = excluded.guest_id,
-                        profile_id = excluded.profile_id,
-                        session_token = excluded.session_token,
-                        last_seen_at = excluded.last_seen_at
-                    """,
-                    (
-                        guest_id,
-                        normalized_device_id,
-                        profile_id,
-                        session_token,
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-                if old_session_token and old_session_token != session_token:
-                    conn.execute(
-                        "DELETE FROM sessions WHERE token = ?",
-                        (old_session_token,),
+                scope = {
+                    "mode": "guest",
+                    "profile_id": profile_id,
+                    "user_id": None,
+                    "guest_id": guest_id,
+                    "device_id": normalized_device_id,
+                }
+                if not session_token:
+                    session_token = secrets.token_urlsafe(32)
+                if not reused_existing_session:
+                    upsert_session_row(
+                        conn,
+                        token=session_token,
+                        profile_id=profile_id,
+                        mode="guest",
+                        guest_id=guest_id,
+                        device_id=normalized_device_id,
+                        created_at=timestamp,
+                        last_seen_at=timestamp,
                     )
-                scope = ownership_scope_for_profile(profile_id, conn)
-                if created_profile:
-                    normalized_memory = normalize_memory({})
                     conn.execute(
                         """
-                        INSERT INTO memories
-                            (profile_id, user_id, guest_id, device_id, name, role, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(profile_id) DO UPDATE SET
-                            user_id = excluded.user_id,
+                        INSERT INTO guest_sessions
+                            (guest_id, device_id, profile_id, session_token, created_at, last_seen_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(device_id) DO UPDATE SET
                             guest_id = excluded.guest_id,
-                            device_id = excluded.device_id,
-                            name = excluded.name,
-                            role = excluded.role,
-                            updated_at = excluded.updated_at
+                            profile_id = excluded.profile_id,
+                            session_token = excluded.session_token,
+                            last_seen_at = excluded.last_seen_at
                         """,
                         (
+                            guest_id,
+                            normalized_device_id,
                             profile_id,
-                            *owner_values(scope),
-                            normalized_memory["name"],
-                            normalized_memory["role"],
+                            session_token,
+                            timestamp,
                             timestamp,
                         ),
                     )
-                    default_settings = settings_to_db(DEFAULT_SETTINGS)
-                    conn.execute(
-                        """
-                        INSERT INTO settings
-                            (profile_id, user_id, guest_id, device_id, voice_enabled, sentence_voice,
-                             search_enabled, rag_enabled, voice_name, voice_speed, last_spoken_response,
-                             theme, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(profile_id) DO UPDATE SET
-                            user_id = excluded.user_id,
-                            guest_id = excluded.guest_id,
-                            device_id = excluded.device_id,
-                            voice_enabled = excluded.voice_enabled,
-                            sentence_voice = excluded.sentence_voice,
-                            search_enabled = excluded.search_enabled,
-                            rag_enabled = excluded.rag_enabled,
-                            voice_name = excluded.voice_name,
-                            voice_speed = excluded.voice_speed,
-                            last_spoken_response = excluded.last_spoken_response,
-                            theme = excluded.theme,
-                            updated_at = excluded.updated_at
-                        """,
-                        (
-                            profile_id,
-                            *owner_values(scope),
-                            int(bool(default_settings["voiceEnabled"])),
-                            int(bool(default_settings["sentenceVoice"])),
-                            int(bool(default_settings["searchEnabled"])),
-                            int(bool(default_settings["ragEnabled"])),
-                            str(default_settings["voiceName"] or ""),
-                            str(default_settings["voiceSpeed"] or "normal"),
-                            str(default_settings["lastSpokenResponse"] or ""),
-                            str(default_settings["theme"] or "midnight"),
-                            timestamp,
-                        ),
-                    )
-                conn.execute(
-                    """
-                    INSERT INTO activity_events
-                        (id, profile_id, user_id, guest_id, device_id,
-                         event_type, detail, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        profile_id,
-                        *owner_values(scope),
-                        "guest_session_started",
-                        encode_json({"mode": "guest"}),
-                        timestamp,
-                    ),
-                )
+                    if old_session_token and old_session_token != session_token:
+                        conn.execute(
+                            "DELETE FROM sessions WHERE token = ?",
+                            (old_session_token,),
+                        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -3866,6 +3807,12 @@ def create_or_load_guest_session(device_id: str | None) -> dict[str, Any]:
         )
         raise
 
+    if scope:
+        if created_profile:
+            ensure_guest_defaults_async(profile_id, scope)
+        else:
+            touch_guest_session_async(session_token, profile_id, guest_id, normalized_device_id)
+    log_activity_async(profile_id, "guest_session_started", {"mode": "guest"})
     profile_dir(profile_id).mkdir(parents=True, exist_ok=True)
     profile["is_guest"] = True
     profile["guest_id"] = guest_id
@@ -3911,6 +3858,7 @@ def consume_guest_usage(
     period_start_at = datetime.now()
     timestamp = period_start_at.isoformat(timespec="seconds")
     period_end = (period_start_at + timedelta(days=1)).isoformat(timespec="seconds")
+    cache_guest_id: str | None = None
     with DATA_LOCK:
         with db_connect() as conn:
             guest_row = conn.execute(
@@ -3927,6 +3875,7 @@ def consume_guest_usage(
 
             if guest_row["device_id"] != normalized_device_id:
                 raise HTTPException(status_code=403, detail="This guest session belongs to another device.")
+            cache_guest_id = guest_row["guest_id"]
 
             for limit_key in requested_keys:
                 limit = GUEST_USAGE_LIMITS[limit_key]
@@ -4012,6 +3961,7 @@ def consume_guest_usage(
                         database_error_hint(exc),
                     )
                     raise
+    clear_guest_usage_status_cache(cache_guest_id, normalized_device_id)
 
 
 def get_guest_usage_status(
@@ -4025,34 +3975,46 @@ def get_guest_usage_status(
     if not normalized_device_id:
         raise HTTPException(status_code=400, detail="Guest mode requires a valid device ID.")
 
-    with DATA_LOCK:
-        with db_connect() as conn:
-            guest_row = conn.execute(
-                """
-                SELECT guest_id, device_id
-                FROM guest_sessions
-                WHERE profile_id = ?
-                """,
-                (profile["id"],),
-            ).fetchone()
-
-            if not guest_row:
-                raise HTTPException(status_code=401, detail="Guest session could not be verified.")
-
-            if guest_row["device_id"] != normalized_device_id:
-                raise HTTPException(status_code=403, detail="This guest session belongs to another device.")
-
-            usage_rows = {
-                row["limit_key"]: int(row["used_count"])
-                for row in conn.execute(
+    guest_id = profile.get("guest_id")
+    profile_device_id = profile.get("device_id")
+    if guest_id and profile_device_id:
+        if profile_device_id != normalized_device_id:
+            raise HTTPException(status_code=403, detail="This guest session belongs to another device.")
+    else:
+        with DATA_LOCK:
+            with db_connect() as conn:
+                guest_row = conn.execute(
                     """
-                    SELECT limit_key, used_count
-                    FROM usage_limits
-                    WHERE guest_id = ? AND device_id = ?
+                    SELECT guest_id, device_id
+                    FROM guest_sessions
+                    WHERE profile_id = ?
                     """,
-                    (guest_row["guest_id"], normalized_device_id),
-                ).fetchall()
-            }
+                    (profile["id"],),
+                ).fetchone()
+
+                if not guest_row:
+                    raise HTTPException(status_code=401, detail="Guest session could not be verified.")
+
+                if guest_row["device_id"] != normalized_device_id:
+                    raise HTTPException(status_code=403, detail="This guest session belongs to another device.")
+                guest_id = guest_row["guest_id"]
+
+    cached = cached_guest_usage_status(str(guest_id), normalized_device_id)
+    if cached:
+        return cached
+
+    with db_connect() as conn:
+        usage_rows = {
+            row["limit_key"]: int(row["used_count"])
+            for row in conn.execute(
+                """
+                SELECT limit_key, used_count
+                FROM usage_limits
+                WHERE guest_id = ? AND device_id = ?
+                """,
+                (guest_id, normalized_device_id),
+            ).fetchall()
+        }
 
     limits = {}
     for limit_key, maximum in GUEST_USAGE_LIMITS.items():
@@ -4063,7 +4025,9 @@ def get_guest_usage_status(
             "remaining": max(0, maximum - used),
         }
 
-    return {"guest": True, "limits": limits}
+    status = {"guest": True, "limits": limits}
+    cache_guest_usage_status(str(guest_id), normalized_device_id, status)
+    return status
 
 
 def insert_activity_event(
@@ -4148,7 +4112,7 @@ def cache_session_access(
         "guest_id": guest_id,
         "user_id": user_id,
     }
-    if mode == "guest" and isinstance(profile, dict):
+    if isinstance(profile, dict):
         cached["profile"] = dict(profile)
     with SESSION_ACCESS_LOCK:
         SESSION_ACCESS_CACHE[token] = cached
@@ -4176,19 +4140,29 @@ def enforce_cached_device_access(cached: dict[str, Any], device_id: str | None) 
         raise HTTPException(status_code=403, detail=DEVICE_PROFILE_NOT_FOUND)
 
 
-def cached_guest_session_context(token: str) -> dict[str, Any] | None:
+def cached_session_context(token: str) -> dict[str, Any] | None:
     cached = cached_session_access(token)
     profile = cached.get("profile") if cached else None
-    if not cached or cached.get("mode") != "guest" or not isinstance(profile, dict):
+    if not cached or not isinstance(profile, dict):
+        return None
+    mode = str(cached.get("mode") or "")
+    if mode not in SESSION_MODES:
         return None
     return {
         "token": token,
-        "mode": "guest",
+        "mode": mode,
         "profile": dict(profile),
         "user_id": cached.get("user_id"),
         "guest_id": cached.get("guest_id"),
         "device_id": cached.get("device_id"),
     }
+
+
+def cached_guest_session_context(token: str) -> dict[str, Any] | None:
+    cached = cached_session_context(token)
+    if cached and cached.get("mode") == "guest":
+        return cached
+    return None
 
 
 def cached_guest_start_response(device_id: str | None) -> dict[str, Any] | None:
@@ -4236,6 +4210,148 @@ def clear_session_caches(token: str | None) -> None:
                 GUEST_DEVICE_SESSION_CACHE.pop(device_id, None)
 
 
+def touch_session_last_seen(token: str, table: str = "sessions") -> None:
+    if table not in {"sessions", "account_sessions"}:
+        return
+    try:
+        with DATA_LOCK:
+            with db_connect() as conn:
+                conn.execute(
+                    f"UPDATE {table} SET last_seen_at = ? WHERE token = ?",
+                    (now_iso(), token),
+                )
+    except Exception:
+        pass
+
+
+def touch_session_last_seen_async(token: str, table: str = "sessions") -> None:
+    threading.Thread(
+        target=touch_session_last_seen,
+        args=(token, table),
+        daemon=True,
+    ).start()
+
+
+def touch_guest_session_async(
+    token: str,
+    profile_id: str,
+    guest_id: str,
+    device_id: str,
+) -> None:
+    def worker() -> None:
+        timestamp = now_iso()
+        try:
+            with DATA_LOCK:
+                with db_connect() as conn:
+                    conn.execute(
+                        "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
+                        (timestamp, token),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE guest_sessions
+                        SET last_seen_at = ?
+                        WHERE guest_id = ? AND device_id = ?
+                        """,
+                        (timestamp, guest_id, device_id),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE profiles
+                        SET last_login_at = ?, device_id = ?
+                        WHERE id = ?
+                        """,
+                        (timestamp, device_id, profile_id),
+                    )
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def ensure_guest_defaults_async(
+    profile_id: str,
+    scope: dict[str, str | None],
+) -> None:
+    def worker() -> None:
+        timestamp = now_iso()
+        try:
+            with DATA_LOCK:
+                with db_connect() as conn:
+                    normalized_memory = normalize_memory({})
+                    conn.execute(
+                        """
+                        INSERT INTO memories
+                            (profile_id, user_id, guest_id, device_id, name, role, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(profile_id) DO NOTHING
+                        """,
+                        (
+                            profile_id,
+                            *owner_values(scope),
+                            normalized_memory["name"],
+                            normalized_memory["role"],
+                            timestamp,
+                        ),
+                    )
+                    default_settings = settings_to_db(DEFAULT_SETTINGS)
+                    conn.execute(
+                        """
+                        INSERT INTO settings
+                            (profile_id, user_id, guest_id, device_id, voice_enabled, sentence_voice,
+                             search_enabled, rag_enabled, voice_name, voice_speed, last_spoken_response,
+                             theme, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(profile_id) DO NOTHING
+                        """,
+                        (
+                            profile_id,
+                            *owner_values(scope),
+                            int(bool(default_settings["voiceEnabled"])),
+                            int(bool(default_settings["sentenceVoice"])),
+                            int(bool(default_settings["searchEnabled"])),
+                            int(bool(default_settings["ragEnabled"])),
+                            str(default_settings["voiceName"] or ""),
+                            str(default_settings["voiceSpeed"] or "normal"),
+                            str(default_settings["lastSpokenResponse"] or ""),
+                            str(default_settings["theme"] or "midnight"),
+                            timestamp,
+                        ),
+                    )
+        except Exception:
+            pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def cached_guest_usage_status(guest_id: str, device_id: str) -> dict[str, Any] | None:
+    key = (guest_id, device_id)
+    with GUEST_USAGE_STATUS_LOCK:
+        cached = GUEST_USAGE_STATUS_CACHE.get(key)
+        if not cached:
+            return None
+        if time.monotonic() - float(cached.get("checked_at") or 0.0) > GUEST_USAGE_STATUS_CACHE_SECONDS:
+            GUEST_USAGE_STATUS_CACHE.pop(key, None)
+            return None
+        return json.loads(json.dumps(cached["status"]))
+
+
+def cache_guest_usage_status(guest_id: str, device_id: str, status: dict[str, Any]) -> None:
+    key = (guest_id, device_id)
+    with GUEST_USAGE_STATUS_LOCK:
+        GUEST_USAGE_STATUS_CACHE[key] = {
+            "checked_at": time.monotonic(),
+            "status": json.loads(json.dumps(status)),
+        }
+
+
+def clear_guest_usage_status_cache(guest_id: str | None, device_id: str | None) -> None:
+    if not guest_id or not device_id:
+        return
+    with GUEST_USAGE_STATUS_LOCK:
+        GUEST_USAGE_STATUS_CACHE.pop((guest_id, device_id), None)
+
+
 def enforce_device_bound_session_access(
     authorization: str | None,
     device_id: str | None,
@@ -4276,9 +4392,9 @@ def enforce_device_bound_session_access(
 
 def get_session_context(authorization: str | None) -> dict[str, Any]:
     token = parse_bearer_token(authorization)
-    cached_guest = cached_guest_session_context(token)
-    if cached_guest:
-        return cached_guest
+    cached = cached_session_context(token)
+    if cached:
+        return cached
 
     ensure_files()
     with DATA_LOCK:
@@ -4319,10 +4435,6 @@ def get_session_context(authorization: str | None) -> dict[str, Any]:
                         detail="Session mode is invalid. Please sign in again.",
                     )
 
-                conn.execute(
-                    "UPDATE sessions SET last_seen_at = ? WHERE token = ?",
-                    (now_iso(), token),
-                )
                 cache_session_access(
                     token,
                     mode=expected_mode,
@@ -4332,6 +4444,7 @@ def get_session_context(authorization: str | None) -> dict[str, Any]:
                     guest_id=session["session_guest_id"] if expected_mode == "guest" else None,
                     user_id=profile.get("user_id"),
                 )
+                touch_session_last_seen_async(token)
                 return {
                     "token": token,
                     "mode": expected_mode,
@@ -4351,18 +4464,15 @@ def get_session_context(authorization: str | None) -> dict[str, Any]:
             delete_session(token)
             raise HTTPException(status_code=401, detail="Account workspace no longer exists.")
 
-        with DATA_LOCK:
-            with db_connect() as conn:
-                conn.execute(
-                    "UPDATE account_sessions SET last_seen_at = ? WHERE token = ?",
-                    (now_iso(), token),
-                )
         cache_session_access(
             token,
             mode="account",
             profile_kind=profile.get("profile_kind"),
             device_id=profile.get("device_id"),
+            profile=profile,
+            user_id=user["id"],
         )
+        touch_session_last_seen_async(token, "account_sessions")
         return {
             "token": token,
             "mode": "account",
@@ -4443,16 +4553,13 @@ def normalize_memory(memory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def load_memory(profile_id: str) -> dict[str, Any]:
+def load_memory(
+    profile_id: str,
+    scope: dict[str, str | None] | None = None,
+) -> dict[str, Any]:
     ensure_files()
     with db_connect() as conn:
-        scope = ownership_scope_for_profile(profile_id, conn)
-        owner_clause, owner_params = owner_where(scope)
-        if not conn.execute(
-            f"SELECT 1 FROM memories WHERE {owner_clause}",
-            owner_params,
-        ).fetchone():
-            upsert_memory_rows(conn, profile_id, {}, scope)
+        scope = scope or ownership_scope_for_profile(profile_id, conn)
         return row_to_memory(conn, profile_id, scope)
 
 
@@ -4464,21 +4571,18 @@ def save_memory(profile_id: str, memory: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def load_settings(profile_id: str) -> dict[str, Any]:
+def load_settings(
+    profile_id: str,
+    scope: dict[str, str | None] | None = None,
+) -> dict[str, Any]:
     ensure_files()
     with db_connect() as conn:
-        scope = ownership_scope_for_profile(profile_id, conn)
+        scope = scope or ownership_scope_for_profile(profile_id, conn)
         owner_clause, owner_params = owner_where(scope)
         row = conn.execute(
             f"SELECT * FROM settings WHERE {owner_clause}",
             owner_params,
         ).fetchone()
-        if row is None:
-            upsert_settings_row(conn, profile_id, DEFAULT_SETTINGS, scope)
-            row = conn.execute(
-                f"SELECT * FROM settings WHERE {owner_clause}",
-                owner_params,
-            ).fetchone()
     return row_to_settings(row)
 
 
@@ -4504,7 +4608,7 @@ def account_voice_settings_profile_id(profile: dict[str, Any]) -> str | None:
 
 
 def load_effective_settings(profile: dict[str, Any]) -> dict[str, Any]:
-    settings = load_settings(profile["id"])
+    settings = load_settings(profile["id"], ownership_scope_from_profile(profile))
     account_settings_id = account_voice_settings_profile_id(profile)
     if not account_settings_id or account_settings_id == profile["id"]:
         return settings
@@ -10721,7 +10825,7 @@ def intelligence_route(
 @app.get("/memory")
 def get_memory(authorization: str | None = Header(None)) -> dict[str, Any]:
     profile = require_workspace_session(authorization)
-    return {"memory": load_memory(profile["id"])}
+    return {"memory": load_memory(profile["id"], ownership_scope_from_profile(profile))}
 
 
 @app.put("/memory")

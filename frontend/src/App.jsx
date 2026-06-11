@@ -731,12 +731,14 @@ function App() {
   const loadAfterAuth = useCallback(async (tokenOverride, profileOverride, accountOverride = null) => {
     const activeMode = profileOverride?.mode || "profile";
     const retainedAccount = profileOverride?.device_bound ? accountOverride : null;
-    const loadedChats = await refreshChatsList(tokenOverride);
-    const loadedCodeChats = await refreshCodeChatsList(tokenOverride);
-    await loadSettings(tokenOverride);
-    await loadMemory(tokenOverride);
-    await loadHealth();
-    await loadGuestLimits(tokenOverride, activeMode === "guest");
+    const [loadedChats, loadedCodeChats] = await Promise.all([
+      refreshChatsList(tokenOverride),
+      refreshCodeChatsList(tokenOverride),
+      loadSettings(tokenOverride),
+      loadMemory(tokenOverride),
+      loadHealth(),
+      loadGuestLimits(tokenOverride, activeMode === "guest")
+    ]);
 
     setProfile(profileOverride);
     setProfileToken(tokenOverride);

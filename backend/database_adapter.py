@@ -22,7 +22,7 @@ class DatabaseSettings:
     connect_timeout: int = 5
     statement_timeout_ms: int = 5000
     lock_timeout_ms: int = 3000
-    pool_max_size: int = 5
+    pool_max_size: int = 8
     pool_timeout: int = 5
     supabase_url: str = ""
     supabase_anon_key: str = ""
