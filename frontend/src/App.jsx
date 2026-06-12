@@ -574,6 +574,7 @@ function App() {
   const chatDetailRequestRef = useRef({ chat: "", code: "" });
   const activeChatIdRef = useRef(null);
   const activeCodeChatIdRef = useRef(null);
+  const profileIdRef = useRef("");
   const chatRef = useRef([]);
   const codeChatRef = useRef([]);
   const copiedStateTimerRef = useRef(null);
@@ -593,6 +594,10 @@ function App() {
   useEffect(() => {
     activeCodeChatIdRef.current = activeCodeChatId;
   }, [activeCodeChatId]);
+
+  useEffect(() => {
+    profileIdRef.current = profile?.id || "";
+  }, [profile?.id]);
 
   useEffect(() => {
     chatRef.current = chat;
@@ -693,8 +698,24 @@ function App() {
     ));
   }, []);
 
-  const setWorkspaceActiveId = useCallback((targetWorkspace, value) => {
-    const storageKey = targetWorkspace === "code" ? ACTIVE_CODE_CHAT_ID_KEY : ACTIVE_CHAT_ID_KEY;
+  const codeChatStorageKey = useCallback((profileId = profileIdRef.current) => (
+    profileId ? `${ACTIVE_CODE_CHAT_ID_KEY}:${profileId}` : ACTIVE_CODE_CHAT_ID_KEY
+  ), []);
+
+  const clearCodeWorkspaceState = useCallback(() => {
+    activeCodeChatIdRef.current = null;
+    codeChatRef.current = [];
+    chatDetailRequestRef.current.code = "";
+    setActiveCodeChatId(null);
+    setCodeChat([]);
+    setCodeChats([]);
+    window.localStorage.removeItem(ACTIVE_CODE_CHAT_ID_KEY);
+  }, []);
+
+  const setWorkspaceActiveId = useCallback((targetWorkspace, value, profileIdOverride = "") => {
+    const storageKey = targetWorkspace === "code"
+      ? codeChatStorageKey(profileIdOverride || profileIdRef.current)
+      : ACTIVE_CHAT_ID_KEY;
     if (value) {
       window.localStorage.setItem(storageKey, value);
     } else {
@@ -702,13 +723,14 @@ function App() {
     }
 
     if (targetWorkspace === "code") {
+      window.localStorage.removeItem(ACTIVE_CODE_CHAT_ID_KEY);
       activeCodeChatIdRef.current = value;
       setActiveCodeChatId(value);
     } else {
       activeChatIdRef.current = value;
       setActiveChatId(value);
     }
-  }, []);
+  }, [codeChatStorageKey]);
 
   const requestJson = useCallback(async (path, options = {}, tokenOverride) => {
     const headers = {
@@ -866,6 +888,12 @@ function App() {
   const loadAfterAuth = useCallback(async (tokenOverride, profileOverride, accountOverride = null) => {
     const activeMode = profileOverride?.mode || "profile";
     const retainedAccount = profileOverride?.device_bound ? accountOverride : null;
+    const nextProfileId = profileOverride?.id || "";
+    const currentProfileId = profileIdRef.current;
+    if (nextProfileId && currentProfileId && nextProfileId !== currentProfileId) {
+      clearCodeWorkspaceState();
+    }
+
     const [loadedChats, loadedCodeChats] = await Promise.all([
       refreshChatsList(tokenOverride),
       refreshCodeChatsList(tokenOverride),
@@ -893,8 +921,9 @@ function App() {
       })
     );
 
+    profileIdRef.current = nextProfileId;
     const previousChatId = activeChatIdRef.current || window.localStorage.getItem(ACTIVE_CHAT_ID_KEY);
-    const previousCodeChatId = activeCodeChatIdRef.current || window.localStorage.getItem(ACTIVE_CODE_CHAT_ID_KEY);
+    const previousCodeChatId = activeCodeChatIdRef.current || window.localStorage.getItem(codeChatStorageKey(nextProfileId));
     const nextChatId = loadedChats.some(item => item.id === previousChatId)
       ? previousChatId
       : loadedChats[0]?.id || null;
@@ -903,7 +932,7 @@ function App() {
       : loadedCodeChats[0]?.id || null;
 
     setWorkspaceActiveId("chat", nextChatId);
-    setWorkspaceActiveId("code", nextCodeChatId);
+    setWorkspaceActiveId("code", nextCodeChatId, nextProfileId);
 
     if (!nextChatId || nextChatId !== previousChatId) {
       setChat([]);
@@ -927,6 +956,8 @@ function App() {
     }
   }, [
     applyChatDetail,
+    clearCodeWorkspaceState,
+    codeChatStorageKey,
     loadChatDetail,
     loadGuestLimits,
     loadHealth,
@@ -1220,9 +1251,11 @@ function App() {
       accountExchangeRef.current = "";
     }
 
+    const currentProfileId = profileIdRef.current;
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(ACTIVE_SESSION_MODE_KEY);
     window.localStorage.removeItem(ACTIVE_CHAT_ID_KEY);
+    window.localStorage.removeItem(codeChatStorageKey(currentProfileId));
     window.localStorage.removeItem(ACTIVE_CODE_CHAT_ID_KEY);
     window.localStorage.removeItem(ACTIVE_WORKSPACE_KEY);
     setProfileToken("");
@@ -1265,6 +1298,7 @@ function App() {
     setProfileLoading(true);
     setAuthError("");
     setActivePanel(null);
+    clearCodeWorkspaceState();
     try {
       await loadProfiles(profileToken);
       setAccountSelectingProfile(true);
@@ -1308,6 +1342,7 @@ function App() {
 
       setDeleteProfileOpen(false);
       setDeleteProfilePin("");
+      window.localStorage.removeItem(codeChatStorageKey(profile?.id || selectedProfileId));
       window.localStorage.removeItem(ACTIVE_CHAT_ID_KEY);
       window.localStorage.removeItem(ACTIVE_CODE_CHAT_ID_KEY);
       window.localStorage.removeItem(ACTIVE_WORKSPACE_KEY);

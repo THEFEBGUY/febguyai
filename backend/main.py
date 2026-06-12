@@ -83,6 +83,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+EMAIL_FROM = os.getenv("EMAIL_FROM", "").strip()
+RESEND_EMAIL_URL = "https://api.resend.com/emails"
 try:
     POSTGRES_CONNECT_TIMEOUT = max(1, int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5") or "5"))
 except ValueError:
@@ -3475,6 +3478,60 @@ def should_expose_dev_pin_reset_code() -> bool:
     return env_name not in {"prod", "production"}
 
 
+def require_email_service_configured() -> None:
+    if not RESEND_API_KEY or not EMAIL_FROM:
+        raise HTTPException(status_code=503, detail="Email service is not configured.")
+
+
+def send_resend_email(*, to_email: str, subject: str, text: str, html: str | None = None) -> None:
+    require_email_service_configured()
+    try:
+        response = requests.post(
+            RESEND_EMAIL_URL,
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "from": EMAIL_FROM,
+                "to": [to_email],
+                "subject": subject,
+                "text": text,
+                **({"html": html} if html else {}),
+            },
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        LOGGER.warning("Resend email request failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Email could not be sent.") from exc
+
+    if not 200 <= response.status_code < 300:
+        LOGGER.warning("Resend email request failed with status %s", response.status_code)
+        raise HTTPException(status_code=502, detail="Email could not be sent.")
+
+
+def send_pin_reset_email(*, to_email: str, profile_name: str, code: str) -> None:
+    safe_profile_name = (profile_name or "your profile").strip() or "your profile"
+    text = (
+        f"Your FebGuyAI PIN reset code for {safe_profile_name} is {code}.\n\n"
+        f"This code expires in {PIN_RESET_CODE_TTL_SECONDS // 60} minutes. "
+        "If you did not request this, you can ignore this email."
+    )
+    html_body = (
+        "<p>Your FebGuyAI PIN reset code for "
+        f"<strong>{html.escape(safe_profile_name)}</strong> is:</p>"
+        f"<p style=\"font-size:24px;font-weight:700;letter-spacing:4px;\">{html.escape(code)}</p>"
+        f"<p>This code expires in {PIN_RESET_CODE_TTL_SECONDS // 60} minutes.</p>"
+        "<p>If you did not request this, you can ignore this email.</p>"
+    )
+    send_resend_email(
+        to_email=to_email,
+        subject="Your FebGuyAI PIN reset code",
+        text=text,
+        html=html_body,
+    )
+
+
 def find_profile(profile_id: str) -> dict[str, Any] | None:
     ensure_files()
     with db_connect() as conn:
@@ -3618,6 +3675,22 @@ def store_profile_pin_reset_code(
                 ),
             )
     return expires_at
+
+
+def invalidate_profile_pin_reset_codes(*, user_id: str, profile_id: str, device_id: str) -> None:
+    with DATA_LOCK:
+        with db_connect() as conn:
+            conn.execute(
+                """
+                UPDATE profile_pin_reset_codes
+                SET used_at = ?
+                WHERE user_id = ?
+                    AND profile_id = ?
+                    AND device_id = ?
+                    AND used_at IS NULL
+                """,
+                (now_iso(), user_id, profile_id, device_id),
+            )
 
 
 def verify_profile_pin_reset_code(
@@ -11410,6 +11483,7 @@ def start_profile_pin_reset(
     if not user:
         raise HTTPException(status_code=401, detail="Signed-in account no longer exists.")
 
+    require_email_service_configured()
     code = generate_pin_reset_code()
     expires_at = store_profile_pin_reset_code(
         user_id=user_id,
@@ -11417,6 +11491,20 @@ def start_profile_pin_reset(
         device_id=device_id,
         code=code,
     )
+    try:
+        send_pin_reset_email(
+            to_email=user["email"],
+            profile_name=profile.get("name", "Profile"),
+            code=code,
+        )
+    except HTTPException:
+        invalidate_profile_pin_reset_codes(
+            user_id=user_id,
+            profile_id=profile["id"],
+            device_id=device_id,
+        )
+        raise
+
     log_activity(
         user["workspace_profile_id"],
         "profile_pin_reset_started",
@@ -11428,13 +11516,9 @@ def start_profile_pin_reset(
         "email": user["email"],
         "expires_at": expires_at,
         "expires_in_seconds": PIN_RESET_CODE_TTL_SECONDS,
-        "message": f"Verification code prepared for {user['email']}.",
+        "message": f"Verification code sent to {user['email']}.",
+        "delivery": "resend",
     }
-    if should_expose_dev_pin_reset_code():
-        response["dev_code"] = code
-        response["delivery"] = "local_development"
-    else:
-        response["delivery"] = "email_or_otp_provider"
     return response
 
 
