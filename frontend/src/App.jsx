@@ -560,6 +560,8 @@ function App() {
   const activeStreamReaderRef = useRef(null);
   const stoppedStreamReaderRef = useRef(null);
   const chatDetailRequestRef = useRef({ chat: "", code: "" });
+  const activeChatIdRef = useRef(null);
+  const activeCodeChatIdRef = useRef(null);
   const copiedStateTimerRef = useRef(null);
   const speechRequestRef = useRef(0);
 
@@ -569,6 +571,14 @@ function App() {
   const activeId = isCodeWorkspace ? activeCodeChatId : activeChatId;
   const activeCodeChatItem = codeChats.find(item => item.id === activeCodeChatId);
   const activeCodeProjectFiles = activeCodeChatItem?.projectFiles || [];
+
+  useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  useEffect(() => {
+    activeCodeChatIdRef.current = activeCodeChatId;
+  }, [activeCodeChatId]);
 
   const releasePreviewUrls = useCallback(() => {
     if (previewUrlRef.current) {
@@ -604,17 +614,47 @@ function App() {
     }
   }, []);
 
+  const mergeChatRecord = useCallback((serverChat, currentChat = {}, options = {}) => {
+    const serverMessages = Array.isArray(serverChat?.messages) ? serverChat.messages : [];
+    const currentMessages = Array.isArray(currentChat?.messages) ? currentChat.messages : [];
+    const preserveExistingMessages = options.preserveExistingMessages !== false;
+    const merged = {
+      ...currentChat,
+      ...serverChat,
+      pending: Boolean(serverChat?.pending),
+      messages: preserveExistingMessages && serverMessages.length === 0 ? currentMessages : serverMessages
+    };
+
+    if (preserveExistingMessages && serverMessages.length === 0 && currentMessages.length === 0) {
+      merged.messages = serverMessages;
+    }
+
+    if (Array.isArray(serverChat?.projectFiles) || Array.isArray(currentChat?.projectFiles)) {
+      const serverProjectFiles = Array.isArray(serverChat?.projectFiles) ? serverChat.projectFiles : [];
+      const currentProjectFiles = Array.isArray(currentChat?.projectFiles) ? currentChat.projectFiles : [];
+      merged.projectFiles = serverProjectFiles.length > 0 ? serverProjectFiles : currentProjectFiles;
+    }
+
+    return merged;
+  }, []);
+
   const mergePendingChats = useCallback((serverChats, currentChats) => {
-    const nextChats = serverChats || [];
-    const serverIds = new Set(nextChats.map(item => item.id));
+    const currentById = new Map((currentChats || []).filter(item => item?.id).map(item => [item.id, item]));
+    const serverIds = new Set();
+    const nextChats = (serverChats || []).map(item => {
+      serverIds.add(item.id);
+      return mergeChatRecord(item, currentById.get(item.id));
+    });
     const pendingChats = (currentChats || []).filter(item => item.pending && !serverIds.has(item.id));
     return [...pendingChats, ...nextChats];
-  }, []);
+  }, [mergeChatRecord]);
 
   const setWorkspaceActiveId = useCallback((targetWorkspace, value) => {
     if (targetWorkspace === "code") {
+      activeCodeChatIdRef.current = value;
       setActiveCodeChatId(value);
     } else {
+      activeChatIdRef.current = value;
       setActiveChatId(value);
     }
   }, []);
@@ -643,6 +683,40 @@ function App() {
 
     return res.json();
   }, [apiBase, authHeaders]);
+
+  const loadChatDetail = useCallback(async (targetWorkspace, chatId, tokenOverride) => {
+    if (!chatId) {
+      return null;
+    }
+    const prefix = targetWorkspace === "code" ? "/code" : "";
+    const data = await requestJson(`${prefix}/chats/${chatId}`, {}, tokenOverride);
+    return data.chat || null;
+  }, [requestJson]);
+
+  const applyChatDetail = useCallback((targetWorkspace, loadedChat, updateMessages = true) => {
+    if (!loadedChat?.id) {
+      return;
+    }
+
+    setWorkspaceChats(targetWorkspace, prev => {
+      const found = prev.some(item => item.id === loadedChat.id);
+      if (!found) {
+        return [loadedChat, ...prev];
+      }
+      return prev.map(item => (
+        item.id === loadedChat.id
+          ? mergeChatRecord(loadedChat, item, { preserveExistingMessages: false })
+          : item
+      ));
+    });
+
+    if (updateMessages) {
+      setWorkspaceMessages(
+        targetWorkspace,
+        Array.isArray(loadedChat.messages) ? loadedChat.messages : []
+      );
+    }
+  }, [mergeChatRecord, setWorkspaceChats, setWorkspaceMessages]);
 
   const loadProfiles = useCallback(async (tokenOverride) => {
     try {
@@ -768,22 +842,50 @@ function App() {
       })
     );
 
-    if (loadedChats.length > 0) {
-      setActiveChatId(loadedChats[0].id);
-      setChat(loadedChats[0].messages || []);
-    } else {
-      setActiveChatId(null);
+    const previousChatId = activeChatIdRef.current;
+    const previousCodeChatId = activeCodeChatIdRef.current;
+    const nextChatId = loadedChats.some(item => item.id === previousChatId)
+      ? previousChatId
+      : loadedChats[0]?.id || null;
+    const nextCodeChatId = loadedCodeChats.some(item => item.id === previousCodeChatId)
+      ? previousCodeChatId
+      : loadedCodeChats[0]?.id || null;
+
+    activeChatIdRef.current = nextChatId;
+    activeCodeChatIdRef.current = nextCodeChatId;
+    setActiveChatId(nextChatId);
+    setActiveCodeChatId(nextCodeChatId);
+
+    if (!nextChatId || nextChatId !== previousChatId) {
       setChat([]);
     }
 
-    if (loadedCodeChats.length > 0) {
-      setActiveCodeChatId(loadedCodeChats[0].id);
-      setCodeChat(loadedCodeChats[0].messages || []);
-    } else {
-      setActiveCodeChatId(null);
+    if (!nextCodeChatId || nextCodeChatId !== previousCodeChatId) {
       setCodeChat([]);
     }
-  }, [loadGuestLimits, loadHealth, loadMemory, loadSettings, refreshChatsList, refreshCodeChatsList]);
+
+    const [loadedChatDetail, loadedCodeChatDetail] = await Promise.all([
+      nextChatId ? loadChatDetail("chat", nextChatId, tokenOverride).catch(() => null) : Promise.resolve(null),
+      nextCodeChatId ? loadChatDetail("code", nextCodeChatId, tokenOverride).catch(() => null) : Promise.resolve(null)
+    ]);
+
+    if (loadedChatDetail && activeChatIdRef.current === loadedChatDetail.id) {
+      applyChatDetail("chat", loadedChatDetail);
+    }
+
+    if (loadedCodeChatDetail && activeCodeChatIdRef.current === loadedCodeChatDetail.id) {
+      applyChatDetail("code", loadedCodeChatDetail);
+    }
+  }, [
+    applyChatDetail,
+    loadChatDetail,
+    loadGuestLimits,
+    loadHealth,
+    loadMemory,
+    loadSettings,
+    refreshChatsList,
+    refreshCodeChatsList
+  ]);
 
   const enterAuthenticatedSession = useCallback(async (tokenOverride, profileOverride, accountOverride = null) => {
     if (profileOverride?.mode !== "account") {
@@ -1470,17 +1572,8 @@ function App() {
       body: JSON.stringify({ title: isCode ? "New Code Chat" : "New Chat" })
     });
 
-    setWorkspaceChats(targetWorkspace, prev => [newChat, ...prev]);
+    setWorkspaceChats(targetWorkspace, prev => [newChat, ...prev.filter(item => item.id !== newChat.id)]);
     return newChat;
-  };
-
-  const loadChatDetail = async (targetWorkspace, chatId) => {
-    if (!chatId) {
-      return null;
-    }
-    const prefix = targetWorkspace === "code" ? "/code" : "";
-    const data = await requestJson(`${prefix}/chats/${chatId}`);
-    return data.chat || null;
   };
 
   const createNewChat = async () => {
@@ -1503,8 +1596,14 @@ function App() {
 
   const openChat = async (chatItem) => {
     const targetWorkspace = workspace;
+    const currentActiveId = targetWorkspace === "code" ? activeCodeChatId : activeChatId;
+    const hasLocalMessages = Array.isArray(chatItem.messages) && chatItem.messages.length > 0;
     setWorkspaceActiveId(targetWorkspace, chatItem.id);
-    setWorkspaceMessages(targetWorkspace, chatItem.messages || []);
+    if (hasLocalMessages) {
+      setWorkspaceMessages(targetWorkspace, chatItem.messages);
+    } else if (chatItem.id !== currentActiveId) {
+      setWorkspaceMessages(targetWorkspace, []);
+    }
     setMessage("");
     setEditingTurn(null);
     setMessageActionMenuKey("");
@@ -1521,14 +1620,7 @@ function App() {
       if (!loadedChat || chatDetailRequestRef.current[targetWorkspace] !== chatItem.id) {
         return;
       }
-      setWorkspaceChats(targetWorkspace, prev => {
-        const found = prev.some(item => item.id === loadedChat.id);
-        if (!found) {
-          return [loadedChat, ...prev];
-        }
-        return prev.map(item => item.id === loadedChat.id ? { ...item, ...loadedChat } : item);
-      });
-      setWorkspaceMessages(targetWorkspace, loadedChat.messages || []);
+      applyChatDetail(targetWorkspace, loadedChat);
     } catch {
       if (chatDetailRequestRef.current[targetWorkspace] === chatItem.id) {
         setAppError("Could not load this chat.");
@@ -1568,11 +1660,15 @@ function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    setWorkspaceChats(targetWorkspace, data.chats || []);
+    if (data.chats) {
+      setWorkspaceChats(targetWorkspace, prev => mergePendingChats(data.chats, prev));
+    }
 
     const currentActiveId = targetWorkspace === "code" ? activeCodeChatId : activeChatId;
     if (data.chat?.id === currentActiveId) {
-      setWorkspaceMessages(targetWorkspace, data.chat.messages || []);
+      applyChatDetail(targetWorkspace, data.chat, Array.isArray(data.chat.messages) && data.chat.messages.length > 0);
+    } else if (data.chat) {
+      applyChatDetail(targetWorkspace, data.chat, false);
     }
   };
 
@@ -1613,12 +1709,25 @@ function App() {
           const targetWorkspace = workspace;
           const data = await requestJson(`${targetWorkspace === "code" ? "/code" : ""}/chats/${chatItem.id}`, { method: "DELETE" });
           const remaining = data.chats || [];
-          setWorkspaceChats(targetWorkspace, remaining);
+          setWorkspaceChats(targetWorkspace, prev => mergePendingChats(remaining, prev));
 
           const currentActiveId = targetWorkspace === "code" ? activeCodeChatId : activeChatId;
           if (currentActiveId === chatItem.id) {
-            setWorkspaceActiveId(targetWorkspace, remaining[0]?.id || null);
-            setWorkspaceMessages(targetWorkspace, remaining[0]?.messages || []);
+            const nextChatId = remaining[0]?.id || null;
+            setWorkspaceActiveId(targetWorkspace, nextChatId);
+            if (!nextChatId) {
+              setWorkspaceMessages(targetWorkspace, []);
+              return;
+            }
+            chatDetailRequestRef.current[targetWorkspace] = nextChatId;
+            try {
+              const loadedChat = await loadChatDetail(targetWorkspace, nextChatId);
+              if (loadedChat && chatDetailRequestRef.current[targetWorkspace] === nextChatId) {
+                applyChatDetail(targetWorkspace, loadedChat);
+              }
+            } catch {
+              setWorkspaceMessages(targetWorkspace, []);
+            }
           }
         } catch {
           setAppError("Could not delete chat.");
@@ -2025,7 +2134,8 @@ function App() {
     if (payload.chat) {
       setWorkspaceChats(targetWorkspace, prev => {
         const withoutActive = prev.filter(item => item.id !== payload.chat.id);
-        return [payload.chat, ...withoutActive];
+        const existing = prev.find(item => item.id === payload.chat.id);
+        return [mergeChatRecord(payload.chat, existing), ...withoutActive];
       });
     }
   };
@@ -2266,7 +2376,7 @@ function App() {
         created_at: timestamp,
         updated_at: timestamp
       };
-      setWorkspaceChats(targetWorkspace, prev => [newChat, ...prev]);
+      setWorkspaceChats(targetWorkspace, prev => [newChat, ...prev.filter(item => item.id !== newChat.id)]);
       setWorkspaceActiveId(targetWorkspace, currentChatId);
     }
 

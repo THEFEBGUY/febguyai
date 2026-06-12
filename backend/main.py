@@ -2710,6 +2710,12 @@ def row_to_chat(
             "updated_at": row["updated_at"],
         }
     )
+    if message_limit is not None and message_limit > 0:
+        chat_item["_recent_messages_only"] = True
+        chat_item["_loaded_message_ids"] = [
+            message["id"] for message in chat_item["messages"] if message.get("id")
+        ]
+    return chat_item
 
 
 def row_to_chat_metadata(row: sqlite3.Row) -> dict[str, Any]:
@@ -2725,12 +2731,6 @@ def row_to_chat_metadata(row: sqlite3.Row) -> dict[str, Any]:
             "updated_at": row["updated_at"],
         }
     )
-    if message_limit is not None and message_limit > 0:
-        chat_item["_recent_messages_only"] = True
-        chat_item["_loaded_message_ids"] = [
-            message["id"] for message in chat_item["messages"] if message.get("id")
-        ]
-    return chat_item
 
 
 def upsert_code_chat_row(
@@ -4949,6 +4949,28 @@ def normalize_chat(chat_item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def ensure_current_chat_shape(
+    chat_id: str,
+    chat_item: dict[str, Any] | None,
+    *,
+    code: bool = False,
+) -> dict[str, Any]:
+    source = chat_item if isinstance(chat_item, dict) else {}
+    title = source.get("title") or ("New Code Chat" if code else "New Chat")
+    messages = source.get("messages") if isinstance(source.get("messages"), list) else []
+    normalized = normalize_chat({**source, "id": source.get("id") or chat_id, "title": title, "messages": messages})
+
+    for key in ("_recent_messages_only", "_loaded_message_ids"):
+        if key in source:
+            normalized[key] = source[key]
+
+    if code:
+        project_files = source.get("projectFiles")
+        normalized["projectFiles"] = project_files if isinstance(project_files, list) else []
+
+    return normalized
+
+
 def sort_chats(chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     newest_first = sorted(
         chats,
@@ -5004,9 +5026,12 @@ def load_chat_by_id(
             (*owner_params, chat_id),
         ).fetchone()
         if row:
-            return row_to_chat(conn, row, scope, message_limit=message_limit)
+            return ensure_current_chat_shape(
+                chat_id,
+                row_to_chat(conn, row, scope, message_limit=message_limit),
+            )
         reject_other_owner_id(conn, "chats", chat_id, scope, "chat")
-    return normalize_chat({"id": chat_id})
+    return ensure_current_chat_shape(chat_id, None)
 
 
 def load_chat_metadata(
@@ -5124,17 +5149,19 @@ def load_code_chat_by_id(
             (*owner_params, chat_id),
         ).fetchone()
         if row:
-            return row_to_code_chat(
-                conn,
-                row,
-                scope,
-                message_limit=message_limit,
-                include_project_files=include_project_files,
+            return ensure_current_chat_shape(
+                chat_id,
+                row_to_code_chat(
+                    conn,
+                    row,
+                    scope,
+                    message_limit=message_limit,
+                    include_project_files=include_project_files,
+                ),
+                code=True,
             )
         reject_other_owner_id(conn, "code_chats", chat_id, scope, "code chat")
-    new_chat = normalize_chat({"id": chat_id, "title": "New Code Chat"})
-    new_chat["projectFiles"] = []
-    return new_chat
+    return ensure_current_chat_shape(chat_id, {"title": "New Code Chat"}, code=True)
 
 
 def load_code_chat_metadata(
