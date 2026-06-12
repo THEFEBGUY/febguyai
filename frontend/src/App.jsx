@@ -455,6 +455,14 @@ const codeExtensions = {
   md: "md"
 };
 
+function BrandLogo() {
+  return (
+    <div className="logo-mark brand-logo" aria-hidden="true">
+      <img src="/sidebar-logo.png" alt="" />
+    </div>
+  );
+}
+
 function App() {
   const [apiBase] = useState(DEFAULT_API_BASE);
   const [deviceId] = useState(loadDeviceId);
@@ -3905,7 +3913,7 @@ function App() {
     <div className="auth-shell flow-screen">
       <section className="loading-card" aria-live="polite">
         <div className="auth-brand">
-          <div className="logo-mark">FGAI</div>
+          <BrandLogo />
           <div>
             <div className="auth-title-row">
               <h1>FebGuy AI</h1>
@@ -3931,7 +3939,7 @@ function App() {
       <div className="auth-layout">
         <section className="auth-showcase">
           <div className="auth-brand">
-            <div className="logo-mark">FGAI</div>
+            <BrandLogo />
             <div>
               <div className="auth-title-row">
                 <h1>FebGuy AI</h1>
@@ -4018,7 +4026,7 @@ function App() {
     <div className="auth-shell flow-screen">
       <section className="auth-card profile-auth-card">
         <div className="auth-brand">
-          <div className="logo-mark">FGAI</div>
+          <BrandLogo />
           <div>
             <div className="auth-title-row">
               <h1>FebGuy AI</h1>
@@ -4263,7 +4271,7 @@ function App() {
     <div className="auth-shell flow-screen">
       <section className="onboarding-card">
         <div className="auth-brand">
-          <div className="logo-mark">FGAI</div>
+          <BrandLogo />
           <div>
             <div className="auth-title-row">
               <h1>FebGuy AI</h1>
@@ -4550,7 +4558,7 @@ function App() {
     <div className={`app-shell theme-${settings.theme} ${isCodeWorkspace ? "workspace-code" : "workspace-chat"} ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
       <aside className="sidebar" aria-label="Workspace sidebar" aria-expanded={!sidebarCollapsed}>
         <div className="brand">
-          <div className="logo-mark">FGAI</div>
+          <BrandLogo />
 
           <div className="brand-copy">
             <h2>FebGuy</h2>

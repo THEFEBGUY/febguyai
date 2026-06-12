@@ -1,0 +1,24 @@
+{
+  "name": "FebGuyAI",
+  "short_name": "FebGuyAI",
+  "description": "FebGuyAI – AI Workspace for Chat, Coding, Documents, Voice and Productivity.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#050a14",
+  "theme_color": "#050a14",
+  "icons": [
+    {
+      "src": "/pwa-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/pwa-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
