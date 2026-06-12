@@ -41,6 +41,9 @@ import { supabase, supabaseConfigured } from "./supabaseClient";
 const DEFAULT_API_BASE = import.meta.env?.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 const SESSION_KEY = "febguy_profile_session";
 const ACTIVE_SESSION_MODE_KEY = "febguy_active_session_mode";
+const ACTIVE_CHAT_ID_KEY = "febguy_active_chat_id";
+const ACTIVE_CODE_CHAT_ID_KEY = "febguy_active_code_chat_id";
+const ACTIVE_WORKSPACE_KEY = "febguy_active_workspace";
 const DEVICE_ID_KEY = "febguy_device_id";
 const SKIP_GUEST_AUTO_START_KEY = "febguy_skip_guest_auto_start";
 const ANSWER_LENGTH_KEY = "febguy_answer_length";
@@ -259,6 +262,15 @@ function loadStoredOption(key, options, fallback) {
   }
 }
 
+function loadActiveWorkspace() {
+  try {
+    const value = window.localStorage.getItem(ACTIVE_WORKSPACE_KEY);
+    return value === "code" ? "code" : "chat";
+  } catch {
+    return "chat";
+  }
+}
+
 function loadResponseFeedback() {
   try {
     const value = JSON.parse(window.localStorage.getItem(RESPONSE_FEEDBACK_KEY) || "{}");
@@ -470,7 +482,7 @@ function App() {
   const [profileLoading, setProfileLoading] = useState(false);
 
   const [message, setMessage] = useState("");
-  const [workspace, setWorkspace] = useState("chat");
+  const [workspace, setWorkspace] = useState(loadActiveWorkspace);
   const [workspaceMotionKey, setWorkspaceMotionKey] = useState(0);
   const [chat, setChat] = useState([]);
   const [chats, setChats] = useState([]);
@@ -562,6 +574,8 @@ function App() {
   const chatDetailRequestRef = useRef({ chat: "", code: "" });
   const activeChatIdRef = useRef(null);
   const activeCodeChatIdRef = useRef(null);
+  const chatRef = useRef([]);
+  const codeChatRef = useRef([]);
   const copiedStateTimerRef = useRef(null);
   const speechRequestRef = useRef(0);
 
@@ -579,6 +593,14 @@ function App() {
   useEffect(() => {
     activeCodeChatIdRef.current = activeCodeChatId;
   }, [activeCodeChatId]);
+
+  useEffect(() => {
+    chatRef.current = chat;
+  }, [chat]);
+
+  useEffect(() => {
+    codeChatRef.current = codeChat;
+  }, [codeChat]);
 
   const releasePreviewUrls = useCallback(() => {
     if (previewUrlRef.current) {
@@ -600,7 +622,16 @@ function App() {
 
   const setWorkspaceMessages = useCallback((targetWorkspace, updater) => {
     if (targetWorkspace === "code") {
-      setCodeChat(updater);
+      const nextMessages = typeof updater === "function" ? updater(codeChatRef.current) : updater;
+      const safeMessages = Array.isArray(nextMessages) ? nextMessages : [];
+      codeChatRef.current = safeMessages;
+      setCodeChat(safeMessages);
+      const currentChatId = activeCodeChatIdRef.current;
+      if (currentChatId) {
+        setCodeChats(prev => prev.map(item => (
+          item.id === currentChatId ? { ...item, messages: safeMessages } : item
+        )));
+      }
     } else {
       setChat(updater);
     }
@@ -649,7 +680,27 @@ function App() {
     return [...pendingChats, ...nextChats];
   }, [mergeChatRecord]);
 
+  const attachActiveMessagesToChats = useCallback((targetWorkspace, chatItems) => {
+    const currentChatId = targetWorkspace === "code" ? activeCodeChatIdRef.current : activeChatIdRef.current;
+    const currentMessages = targetWorkspace === "code" ? codeChatRef.current : chatRef.current;
+
+    if (!currentChatId || !Array.isArray(currentMessages) || currentMessages.length === 0) {
+      return chatItems || [];
+    }
+
+    return (chatItems || []).map(item => (
+      item.id === currentChatId ? { ...item, messages: currentMessages } : item
+    ));
+  }, []);
+
   const setWorkspaceActiveId = useCallback((targetWorkspace, value) => {
+    const storageKey = targetWorkspace === "code" ? ACTIVE_CODE_CHAT_ID_KEY : ACTIVE_CHAT_ID_KEY;
+    if (value) {
+      window.localStorage.setItem(storageKey, value);
+    } else {
+      window.localStorage.removeItem(storageKey);
+    }
+
     if (targetWorkspace === "code") {
       activeCodeChatIdRef.current = value;
       setActiveCodeChatId(value);
@@ -742,9 +793,9 @@ function App() {
   const refreshCodeChatsList = useCallback(async (tokenOverride) => {
     const data = await requestJson("/code/chats", {}, tokenOverride);
     const loadedChats = data.chats || [];
-    setCodeChats(prev => mergePendingChats(loadedChats, prev));
+    setCodeChats(prev => mergePendingChats(loadedChats, attachActiveMessagesToChats("code", prev)));
     return data.chats || [];
-  }, [mergePendingChats, requestJson]);
+  }, [attachActiveMessagesToChats, mergePendingChats, requestJson]);
 
   const loadMemory = useCallback(async (tokenOverride) => {
     const data = await requestJson("/memory", {}, tokenOverride);
@@ -842,8 +893,8 @@ function App() {
       })
     );
 
-    const previousChatId = activeChatIdRef.current;
-    const previousCodeChatId = activeCodeChatIdRef.current;
+    const previousChatId = activeChatIdRef.current || window.localStorage.getItem(ACTIVE_CHAT_ID_KEY);
+    const previousCodeChatId = activeCodeChatIdRef.current || window.localStorage.getItem(ACTIVE_CODE_CHAT_ID_KEY);
     const nextChatId = loadedChats.some(item => item.id === previousChatId)
       ? previousChatId
       : loadedChats[0]?.id || null;
@@ -851,10 +902,8 @@ function App() {
       ? previousCodeChatId
       : loadedCodeChats[0]?.id || null;
 
-    activeChatIdRef.current = nextChatId;
-    activeCodeChatIdRef.current = nextCodeChatId;
-    setActiveChatId(nextChatId);
-    setActiveCodeChatId(nextCodeChatId);
+    setWorkspaceActiveId("chat", nextChatId);
+    setWorkspaceActiveId("code", nextCodeChatId);
 
     if (!nextChatId || nextChatId !== previousChatId) {
       setChat([]);
@@ -884,7 +933,8 @@ function App() {
     loadMemory,
     loadSettings,
     refreshChatsList,
-    refreshCodeChatsList
+    refreshCodeChatsList,
+    setWorkspaceActiveId
   ]);
 
   const enterAuthenticatedSession = useCallback(async (tokenOverride, profileOverride, accountOverride = null) => {
@@ -1172,6 +1222,9 @@ function App() {
 
     window.localStorage.removeItem(SESSION_KEY);
     window.localStorage.removeItem(ACTIVE_SESSION_MODE_KEY);
+    window.localStorage.removeItem(ACTIVE_CHAT_ID_KEY);
+    window.localStorage.removeItem(ACTIVE_CODE_CHAT_ID_KEY);
+    window.localStorage.removeItem(ACTIVE_WORKSPACE_KEY);
     setProfileToken("");
     setProfile(null);
     setSessionMode("");
@@ -1255,6 +1308,9 @@ function App() {
 
       setDeleteProfileOpen(false);
       setDeleteProfilePin("");
+      window.localStorage.removeItem(ACTIVE_CHAT_ID_KEY);
+      window.localStorage.removeItem(ACTIVE_CODE_CHAT_ID_KEY);
+      window.localStorage.removeItem(ACTIVE_WORKSPACE_KEY);
       setChats([]);
       setChat([]);
       setActiveChatId(null);
@@ -1628,6 +1684,39 @@ function App() {
     }
   };
 
+  const ensureWorkspaceChatDetailLoaded = useCallback((targetWorkspace) => {
+    const currentChatId = targetWorkspace === "code" ? activeCodeChatIdRef.current : activeChatIdRef.current;
+    if (!currentChatId) {
+      return;
+    }
+
+    const currentMessages = targetWorkspace === "code" ? codeChatRef.current : chatRef.current;
+    if (Array.isArray(currentMessages) && currentMessages.length > 0) {
+      return;
+    }
+
+    const sourceChats = targetWorkspace === "code" ? codeChats : chats;
+    const cachedChat = sourceChats.find(item => item.id === currentChatId);
+    if (Array.isArray(cachedChat?.messages) && cachedChat.messages.length > 0) {
+      setWorkspaceMessages(targetWorkspace, cachedChat.messages);
+      return;
+    }
+
+    chatDetailRequestRef.current[targetWorkspace] = currentChatId;
+    loadChatDetail(targetWorkspace, currentChatId)
+      .then(loadedChat => {
+        const stillActiveId = targetWorkspace === "code" ? activeCodeChatIdRef.current : activeChatIdRef.current;
+        if (
+          loadedChat?.id === currentChatId &&
+          stillActiveId === currentChatId &&
+          chatDetailRequestRef.current[targetWorkspace] === currentChatId
+        ) {
+          applyChatDetail(targetWorkspace, loadedChat);
+        }
+      })
+      .catch(() => {});
+  }, [applyChatDetail, chats, codeChats, loadChatDetail, setWorkspaceMessages]);
+
   const switchWorkspace = (nextWorkspace) => {
     if (nextWorkspace === workspace) {
       return;
@@ -1642,6 +1731,11 @@ function App() {
     }
 
     setWorkspace(nextWorkspace);
+    try {
+      window.localStorage.setItem(ACTIVE_WORKSPACE_KEY, nextWorkspace);
+    } catch {
+      // Workspace selection remains valid for this tab if storage is unavailable.
+    }
     setSidebarRecentOpen(false);
     setWorkspaceMotionKey(key => key + 1);
     setMessage("");
@@ -1651,6 +1745,9 @@ function App() {
     setDocumentsDrawer(null);
     setAppError("");
     resetFileInput();
+    if (nextWorkspace === "code") {
+      ensureWorkspaceChatDetailLoaded("code");
+    }
   };
 
   const updateChatAction = async (chatId, payload) => {

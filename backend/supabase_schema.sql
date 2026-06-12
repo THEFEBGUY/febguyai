@@ -322,6 +322,7 @@ create table if not exists public.files (
   guest_id uuid,
   device_id text,
   file_name text not null,
+  original_name text not null default '',
   file_type text,
   path text not null unique,
   document_id uuid,
@@ -523,6 +524,7 @@ alter table public.files add column if not exists user_id uuid;
 alter table public.files add column if not exists guest_id uuid;
 alter table public.files add column if not exists device_id uuid;
 alter table public.files add column if not exists file_name text;
+alter table public.files add column if not exists original_name text not null default '';
 alter table public.files add column if not exists file_type text;
 alter table public.files add column if not exists path text;
 alter table public.files add column if not exists document_id uuid;
@@ -711,6 +713,9 @@ set role = case
   else 'assistant'
 end
 where role is null or lower(role) not in ('user', 'assistant', 'system');
+update public.files
+set original_name = coalesce(nullif(original_name, ''), nullif(file_name, ''), 'file')
+where original_name is null or original_name = '';
 
 -- Re-apply integer defaults after type conversion. This is safe to rerun.
 update public.users set onboarding_completed = 0 where onboarding_completed is null;
@@ -731,6 +736,8 @@ alter table public.usage_limits alter column period_start set not null;
 alter table public.usage_limits alter column period_end set not null;
 alter table public.usage_limits alter column created_at set not null;
 alter table public.usage_limits alter column updated_at set not null;
+alter table public.files alter column original_name set default '';
+alter table public.files alter column original_name set not null;
 alter table public.users alter column onboarding_completed set default 0;
 alter table public.users alter column onboarding_completed set not null;
 alter table public.settings alter column voice_enabled set default 1;

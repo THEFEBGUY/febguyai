@@ -420,6 +420,8 @@ SESSION_ACCESS_CACHE: dict[str, dict[str, Any]] = {}
 SESSION_ACCESS_LOCK = threading.Lock()
 GUEST_DEVICE_SESSION_CACHE: dict[str, dict[str, Any]] = {}
 GUEST_DEVICE_SESSION_LOCK = threading.Lock()
+DEVICE_ROW_CACHE: set[str] = set()
+DEVICE_ROW_CACHE_LOCK = threading.Lock()
 GUEST_USAGE_STATUS_CACHE_SECONDS = 10
 GUEST_USAGE_STATUS_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 GUEST_USAGE_STATUS_LOCK = threading.Lock()
@@ -429,6 +431,59 @@ MEMORY_CACHE: dict[str, dict[str, Any]] = {}
 WORKSPACE_CONTEXT_CACHE_LOCK = threading.Lock()
 TABLE_COLUMN_CACHE: dict[tuple[str, str], set[str]] = {}
 TABLE_COLUMN_LOCK = threading.Lock()
+POSTGRES_KNOWN_TABLE_COLUMNS: dict[str, set[str]] = {
+    "devices": {
+        "id",
+        "client_device_id",
+        "device_id",
+        "created_at",
+        "updated_at",
+        "last_seen_at",
+    },
+    "sessions": {
+        "token",
+        "token_hash",
+        "profile_id",
+        "user_id",
+        "mode",
+        "guest_id",
+        "device_id",
+        "created_at",
+        "last_seen_at",
+    },
+    "usage_limits": {
+        "id",
+        "guest_id",
+        "device_id",
+        "limit_key",
+        "period_start",
+        "period_end",
+        "used_count",
+        "max_count",
+        "metadata",
+        "created_at",
+        "updated_at",
+    },
+    "files": {
+        "id",
+        "profile_id",
+        "user_id",
+        "guest_id",
+        "device_id",
+        "file_name",
+        "original_name",
+        "file_type",
+        "mime_type",
+        "path",
+        "storage_path",
+        "document_id",
+        "size_bytes",
+        "metadata",
+        "created_at",
+        "updated_at",
+    },
+}
+GUEST_BACKGROUND_SETUP_DELAY_SECONDS = 15.0
 try:
     DATABASE_HEALTH_CACHE_SECONDS = max(
         1,
@@ -1194,6 +1249,10 @@ def postgres_schema_version(conn: sqlite3.Connection) -> str | None:
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchone()
     except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
         return None
     return row["value"] if row and row["value"] else None
 
@@ -1224,8 +1283,12 @@ def init_postgres_database() -> None:
         raise RuntimeError("Supabase/Postgres schema file is missing.")
 
     with db_connect() as conn:
+        schema_version = postgres_schema_version(conn)
+        if schema_version == POSTGRES_SCHEMA_VERSION:
+            return
+
         if postgres_core_schema_exists(conn):
-            if postgres_schema_version(conn) != POSTGRES_SCHEMA_VERSION:
+            if schema_version != POSTGRES_SCHEMA_VERSION:
                 conn.executescript(POSTGRES_RUNTIME_REPAIR_SQL)
         else:
             conn.executescript(schema_path.read_text(encoding="utf-8"))
@@ -1814,6 +1877,8 @@ def init_database() -> None:
 def table_column_names(conn: sqlite3.Connection, table_name: str) -> set[str]:
     if not table_name.replace("_", "").isalnum():
         return set()
+    if DATABASE.is_postgres_active() and table_name in POSTGRES_KNOWN_TABLE_COLUMNS:
+        return set(POSTGRES_KNOWN_TABLE_COLUMNS[table_name])
     cache_key = (DATABASE.active_provider, table_name)
     with TABLE_COLUMN_LOCK:
         cached = TABLE_COLUMN_CACHE.get(cache_key)
@@ -1836,6 +1901,10 @@ def ensure_device_row(conn: sqlite3.Connection, device_id: str | None) -> None:
     normalized_device_id = validate_device_id(device_id)
     if not normalized_device_id:
         return
+
+    with DEVICE_ROW_CACHE_LOCK:
+        if normalized_device_id in DEVICE_ROW_CACHE:
+            return
 
     columns = table_column_names(conn, "devices")
     if not columns:
@@ -1894,6 +1963,8 @@ def ensure_device_row(conn: sqlite3.Connection, device_id: str | None) -> None:
         f"INSERT INTO devices ({column_sql}) VALUES ({placeholders}) {conflict_sql}",
         tuple(values),
     )
+    with DEVICE_ROW_CACHE_LOCK:
+        DEVICE_ROW_CACHE.add(normalized_device_id)
 
 
 def ensure_scope_device_row(conn: sqlite3.Connection, scope: dict[str, str | None] | None) -> None:
@@ -2389,11 +2460,14 @@ def upsert_chat_header_row(
     profile_id: str,
     chat_item: dict[str, Any],
     scope: dict[str, str | None] | None = None,
+    *,
+    trusted_owner: bool = False,
 ) -> dict[str, Any]:
     scope = scope or ownership_scope_for_profile(profile_id, conn)
     ensure_scope_device_row(conn, scope)
     chat_item = normalize_chat(chat_item)
-    reject_other_owner_id(conn, "chats", chat_item["id"], scope, "chat")
+    if not trusted_owner:
+        reject_other_owner_id(conn, "chats", chat_item["id"], scope, "chat")
     conn.execute(
         """
         INSERT INTO chats
@@ -2432,11 +2506,14 @@ def upsert_code_chat_header_row(
     profile_id: str,
     chat_item: dict[str, Any],
     scope: dict[str, str | None] | None = None,
+    *,
+    trusted_owner: bool = False,
 ) -> dict[str, Any]:
     scope = scope or ownership_scope_for_profile(profile_id, conn)
     ensure_scope_device_row(conn, scope)
     chat_item = normalize_chat(chat_item)
-    reject_other_owner_id(conn, "code_chats", chat_item["id"], scope, "code chat")
+    if not trusted_owner:
+        reject_other_owner_id(conn, "code_chats", chat_item["id"], scope, "code chat")
     conn.execute(
         """
         INSERT INTO code_chats
@@ -2476,21 +2553,27 @@ def append_new_message_rows(
     messages: list[dict[str, Any]],
     loaded_message_ids: Iterable[str],
     scope: dict[str, str | None],
+    *,
+    next_sort_order: int | None = None,
+    trusted_owner: bool = False,
 ) -> None:
     if table not in {"messages", "code_messages"}:
         raise ValueError("Unsupported message table.")
 
     owner_clause, owner_params = owner_where(scope)
-    row = conn.execute(
-        f"""
-        SELECT MAX(sort_order) AS max_sort_order
-        FROM {table}
-        WHERE {owner_clause} AND chat_id = ?
-        """,
-        (*owner_params, chat_id),
-    ).fetchone()
-    max_sort_order = row["max_sort_order"] if row else None
-    next_sort_order = int(max_sort_order) + 1 if max_sort_order is not None else 0
+    if next_sort_order is not None:
+        next_sort_order = int(next_sort_order)
+    else:
+        row = conn.execute(
+            f"""
+            SELECT MAX(sort_order) AS max_sort_order
+            FROM {table}
+            WHERE {owner_clause} AND chat_id = ?
+            """,
+            (*owner_params, chat_id),
+        ).fetchone()
+        max_sort_order = row["max_sort_order"] if row else None
+        next_sort_order = int(max_sort_order) + 1 if max_sort_order is not None else 0
     loaded_ids = {str(message_id) for message_id in loaded_message_ids if message_id}
 
     for message in messages:
@@ -2504,7 +2587,8 @@ def append_new_message_rows(
 
         message.clear()
         message.update(payload)
-        reject_other_owner_id(conn, table, payload["id"], scope, "message")
+        if not trusted_owner:
+            reject_other_owner_id(conn, table, payload["id"], scope, "message")
         try:
             conn.execute(
                 f"""
@@ -2670,7 +2754,7 @@ def row_to_chat(
     if message_limit is not None and message_limit > 0:
         message_rows = conn.execute(
             f"""
-            SELECT payload
+            SELECT payload, sort_order
             FROM (
                 SELECT payload, sort_order
                 FROM messages
@@ -2685,7 +2769,7 @@ def row_to_chat(
     else:
         message_rows = conn.execute(
             f"""
-            SELECT payload
+            SELECT payload, sort_order
             FROM messages
             WHERE {owner_clause} AND chat_id = ?
             ORDER BY sort_order ASC
@@ -2693,10 +2777,17 @@ def row_to_chat(
             (*owner_params, row["id"]),
         ).fetchall()
 
+    max_sort_order = None
     for message_row in message_rows:
         payload = decode_json(message_row["payload"], {})
         if isinstance(payload, dict):
             messages.append(payload)
+        try:
+            sort_order = message_row["sort_order"]
+            if sort_order is not None:
+                max_sort_order = max(int(sort_order), int(max_sort_order if max_sort_order is not None else sort_order))
+        except Exception:
+            pass
 
     chat_item = normalize_chat(
         {
@@ -2715,6 +2806,7 @@ def row_to_chat(
         chat_item["_loaded_message_ids"] = [
             message["id"] for message in chat_item["messages"] if message.get("id")
         ]
+        chat_item["_next_sort_order"] = int(max_sort_order) + 1 if max_sort_order is not None else 0
     return chat_item
 
 
@@ -2853,7 +2945,7 @@ def row_to_code_chat(
     if message_limit is not None and message_limit > 0:
         message_rows = conn.execute(
             f"""
-            SELECT payload
+            SELECT payload, sort_order
             FROM (
                 SELECT payload, sort_order
                 FROM code_messages
@@ -2868,7 +2960,7 @@ def row_to_code_chat(
     else:
         message_rows = conn.execute(
             f"""
-            SELECT payload
+            SELECT payload, sort_order
             FROM code_messages
             WHERE {owner_clause} AND chat_id = ?
             ORDER BY sort_order ASC
@@ -2876,10 +2968,17 @@ def row_to_code_chat(
             (*owner_params, row["id"]),
         ).fetchall()
 
+    max_sort_order = None
     for message_row in message_rows:
         payload = decode_json(message_row["payload"], {})
         if isinstance(payload, dict):
             messages.append(payload)
+        try:
+            sort_order = message_row["sort_order"]
+            if sort_order is not None:
+                max_sort_order = max(int(sort_order), int(max_sort_order if max_sort_order is not None else sort_order))
+        except Exception:
+            pass
 
     chat_item = normalize_chat(
         {
@@ -2897,6 +2996,7 @@ def row_to_code_chat(
         chat_item["_loaded_message_ids"] = [
             message["id"] for message in chat_item["messages"] if message.get("id")
         ]
+        chat_item["_next_sort_order"] = int(max_sort_order) + 1 if max_sort_order is not None else 0
     chat_item["projectFiles"] = (
         load_code_project_files(row["profile_id"], row["id"], conn, scope)
         if include_project_files
@@ -4070,11 +4170,31 @@ def create_or_load_guest_session(device_id: str | None) -> dict[str, Any]:
 
     if scope:
         if created_profile:
-            ensure_guest_defaults_async(profile_id, scope)
+            cache_fresh_guest_defaults(profile_id, guest_id, normalized_device_id)
+            ensure_guest_defaults_async(
+                profile_id,
+                scope,
+                delay_seconds=GUEST_BACKGROUND_SETUP_DELAY_SECONDS,
+            )
         else:
-            touch_guest_session_async(session_token, profile_id, guest_id, normalized_device_id)
-    log_activity_async(profile_id, "guest_session_started", {"mode": "guest"})
-    profile_dir(profile_id).mkdir(parents=True, exist_ok=True)
+            touch_guest_session_async(
+                session_token,
+                profile_id,
+                guest_id,
+                normalized_device_id,
+                delay_seconds=GUEST_BACKGROUND_SETUP_DELAY_SECONDS,
+            )
+    log_activity_async(
+        profile_id,
+        "guest_session_started",
+        {"mode": "guest"},
+        delay_seconds=GUEST_BACKGROUND_SETUP_DELAY_SECONDS,
+    )
+    def ensure_profile_dir_later() -> None:
+        time.sleep(GUEST_BACKGROUND_SETUP_DELAY_SECONDS)
+        profile_dir(profile_id).mkdir(parents=True, exist_ok=True)
+
+    threading.Thread(target=ensure_profile_dir_later, daemon=True).start()
     profile["is_guest"] = True
     profile["guest_id"] = guest_id
     cache_session_access(
@@ -4157,25 +4277,26 @@ def consume_guest_usage(
                 guest_id = guest_row["guest_id"]
                 cache_guest_id = guest_id
 
-            for limit_key in requested_keys:
-                if cached_limits.get(limit_key):
-                    continue
-                limit = GUEST_USAGE_LIMITS[limit_key]
-                usage_row = conn.execute(
-                    """
-                    SELECT used_count
-                    FROM usage_limits
-                    WHERE guest_id = ? AND device_id = ? AND limit_key = ?
-                    """,
-                    (guest_id, normalized_device_id, limit_key),
-                ).fetchone()
-                used_count = int(usage_row["used_count"]) if usage_row else 0
-                if used_count >= limit:
-                    raise HTTPException(status_code=429, detail=GUEST_LIMIT_MESSAGE)
+            if not DATABASE.is_postgres_active():
+                for limit_key in requested_keys:
+                    if cached_limits.get(limit_key):
+                        continue
+                    limit = GUEST_USAGE_LIMITS[limit_key]
+                    usage_row = conn.execute(
+                        """
+                        SELECT used_count
+                        FROM usage_limits
+                        WHERE guest_id = ? AND device_id = ? AND limit_key = ?
+                        """,
+                        (guest_id, normalized_device_id, limit_key),
+                    ).fetchone()
+                    used_count = int(usage_row["used_count"]) if usage_row else 0
+                    if used_count >= limit:
+                        raise HTTPException(status_code=429, detail=GUEST_LIMIT_MESSAGE)
 
+            columns = table_column_names(conn, "usage_limits")
             for limit_key in requested_keys:
                 limit = GUEST_USAGE_LIMITS[limit_key]
-                columns = table_column_names(conn, "usage_limits")
                 insert_values: dict[str, Any] = {
                     "id": str(uuid.uuid4()),
                     "guest_id": guest_id,
@@ -4227,16 +4348,33 @@ def consume_guest_usage(
                     update_assignments.append("metadata = excluded.metadata")
 
                 try:
-                    conn.execute(
-                        f"""
-                        INSERT INTO usage_limits ({", ".join(insert_columns)})
-                        VALUES ({placeholders})
-                        ON CONFLICT(guest_id, device_id, limit_key) DO UPDATE SET
-                            {", ".join(update_assignments)}
-                        """,
-                        tuple(insert_values[column] for column in insert_columns),
-                    )
+                    if DATABASE.is_postgres_active():
+                        row = conn.execute(
+                            f"""
+                            INSERT INTO usage_limits ({", ".join(insert_columns)})
+                            VALUES ({placeholders})
+                            ON CONFLICT(guest_id, device_id, limit_key) DO UPDATE SET
+                                {", ".join(update_assignments)}
+                            WHERE usage_limits.used_count < excluded.max_count
+                            RETURNING used_count
+                            """,
+                            tuple(insert_values[column] for column in insert_columns),
+                        ).fetchone()
+                        if row is None:
+                            raise HTTPException(status_code=429, detail=GUEST_LIMIT_MESSAGE)
+                    else:
+                        conn.execute(
+                            f"""
+                            INSERT INTO usage_limits ({", ".join(insert_columns)})
+                            VALUES ({placeholders})
+                            ON CONFLICT(guest_id, device_id, limit_key) DO UPDATE SET
+                                {", ".join(update_assignments)}
+                            """,
+                            tuple(insert_values[column] for column in insert_columns),
+                        )
                 except Exception as exc:
+                    if isinstance(exc, HTTPException):
+                        raise
                     LOGGER.exception(
                         "DB write failed table=usage_limits limit_key=%s db_hint=%s",
                         limit_key,
@@ -4357,10 +4495,15 @@ def log_activity_async(
     profile_id: str | None,
     event_type: str,
     detail: dict[str, Any] | str | None = None,
+    delay_seconds: float = 0.0,
 ) -> None:
+    def worker() -> None:
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        log_activity(profile_id, event_type, detail)
+
     threading.Thread(
-        target=log_activity,
-        args=(profile_id, event_type, detail),
+        target=worker,
         daemon=True,
     ).start()
 
@@ -4481,6 +4624,22 @@ def cache_guest_start_response(
         }
 
 
+def cache_fresh_guest_defaults(profile_id: str, guest_id: str, device_id: str) -> None:
+    cache_set(SETTINGS_CACHE, profile_id, DEFAULT_SETTINGS.copy())
+    cache_set(MEMORY_CACHE, profile_id, normalize_memory({}))
+    cache_guest_usage_status(
+        guest_id,
+        device_id,
+        {
+            "guest": True,
+            "limits": {
+                key: {"used": 0, "limit": limit, "remaining": limit}
+                for key, limit in GUEST_USAGE_LIMITS.items()
+            },
+        },
+    )
+
+
 def clear_session_caches(token: str | None) -> None:
     if not token:
         return
@@ -4519,8 +4678,11 @@ def touch_guest_session_async(
     profile_id: str,
     guest_id: str,
     device_id: str,
+    delay_seconds: float = 0.0,
 ) -> None:
     def worker() -> None:
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
         timestamp = now_iso()
         try:
             with DATA_LOCK:
@@ -4554,8 +4716,11 @@ def touch_guest_session_async(
 def ensure_guest_defaults_async(
     profile_id: str,
     scope: dict[str, str | None],
+    delay_seconds: float = 0.0,
 ) -> None:
     def worker() -> None:
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
         timestamp = now_iso()
         try:
             with DATA_LOCK:
@@ -4960,7 +5125,7 @@ def ensure_current_chat_shape(
     messages = source.get("messages") if isinstance(source.get("messages"), list) else []
     normalized = normalize_chat({**source, "id": source.get("id") or chat_id, "title": title, "messages": messages})
 
-    for key in ("_recent_messages_only", "_loaded_message_ids"):
+    for key in ("_recent_messages_only", "_loaded_message_ids", "_next_sort_order"):
         if key in source:
             normalized[key] = source[key]
 
@@ -5007,6 +5172,50 @@ def load_chats(profile_id: str) -> list[dict[str, Any]]:
     return sort_chats(chats)
 
 
+def joined_chat_rows_to_chat(
+    chat_id: str,
+    rows: list[sqlite3.Row],
+    *,
+    message_limit: int | None = None,
+) -> dict[str, Any]:
+    first = rows[0]
+    messages: list[dict[str, Any]] = []
+    max_sort_order = None
+    for row in rows:
+        payload = decode_json(row["message_payload"], None)
+        if isinstance(payload, dict):
+            messages.append(payload)
+        try:
+            sort_order = row["message_sort_order"]
+            if sort_order is not None:
+                max_sort_order = max(
+                    int(sort_order),
+                    int(max_sort_order if max_sort_order is not None else sort_order),
+                )
+        except Exception:
+            pass
+
+    chat_item = normalize_chat(
+        {
+            "id": first["id"],
+            "title": first["title"],
+            "summary": first["summary"],
+            "messages": messages,
+            "last_uploaded_file": decode_json(first["last_uploaded_file"], None),
+            "pinned": bool(first["pinned"]),
+            "created_at": first["created_at"],
+            "updated_at": first["updated_at"],
+        }
+    )
+    if message_limit is not None and message_limit > 0:
+        chat_item["_recent_messages_only"] = True
+        chat_item["_loaded_message_ids"] = [
+            message["id"] for message in chat_item["messages"] if message.get("id")
+        ]
+        chat_item["_next_sort_order"] = int(max_sort_order) + 1 if max_sort_order is not None else 0
+    return ensure_current_chat_shape(chat_id, chat_item)
+
+
 def load_chat_by_id(
     profile_id: str,
     chat_id: str,
@@ -5017,19 +5226,51 @@ def load_chat_by_id(
     with db_connect() as conn:
         scope = scope or ownership_scope_for_profile(profile_id, conn)
         owner_clause, owner_params = owner_where(scope)
-        row = conn.execute(
-            f"""
-            SELECT *
-            FROM chats
-            WHERE {owner_clause} AND id = ?
-            """,
-            (*owner_params, chat_id),
-        ).fetchone()
-        if row:
-            return ensure_current_chat_shape(
-                chat_id,
-                row_to_chat(conn, row, scope, message_limit=message_limit),
-            )
+        if message_limit is not None:
+            rows = conn.execute(
+                f"""
+                WITH target_chat AS (
+                    SELECT *
+                    FROM chats
+                    WHERE {owner_clause} AND id = ?
+                ),
+                recent_messages AS (
+                    SELECT payload, sort_order
+                    FROM (
+                        SELECT payload, sort_order
+                        FROM messages
+                        WHERE {owner_clause} AND chat_id = ?
+                        ORDER BY sort_order DESC
+                        LIMIT ?
+                    ) AS limited_messages
+                )
+                SELECT target_chat.id, target_chat.title, target_chat.summary,
+                    target_chat.last_uploaded_file, target_chat.pinned,
+                    target_chat.created_at, target_chat.updated_at,
+                    recent_messages.payload AS message_payload,
+                    recent_messages.sort_order AS message_sort_order
+                FROM target_chat
+                LEFT JOIN recent_messages ON 1 = 1
+                ORDER BY recent_messages.sort_order ASC
+                """,
+                (*owner_params, chat_id, *owner_params, chat_id, int(message_limit)),
+            ).fetchall()
+            if rows:
+                return joined_chat_rows_to_chat(chat_id, rows, message_limit=message_limit)
+        else:
+            row = conn.execute(
+                f"""
+                SELECT *
+                FROM chats
+                WHERE {owner_clause} AND id = ?
+                """,
+                (*owner_params, chat_id),
+            ).fetchone()
+            if row:
+                return ensure_current_chat_shape(
+                    chat_id,
+                    row_to_chat(conn, row, scope, message_limit=message_limit),
+                )
         reject_other_owner_id(conn, "chats", chat_id, scope, "chat")
     return ensure_current_chat_shape(chat_id, None)
 
@@ -5083,6 +5324,8 @@ def save_current_chat(
     profile_id: str,
     chats: list[dict[str, Any]],
     current_chat: dict[str, Any],
+    *,
+    reload_metadata: bool = True,
 ) -> list[dict[str, Any]]:
     current_chat["updated_at"] = now_iso()
     recent_only = bool(current_chat.get("_recent_messages_only"))
@@ -5091,7 +5334,13 @@ def save_current_chat(
         with db_connect() as conn:
             scope = ownership_scope_for_profile(profile_id, conn)
             if recent_only:
-                saved_chat = upsert_chat_header_row(conn, profile_id, current_chat, scope)
+                saved_chat = upsert_chat_header_row(
+                    conn,
+                    profile_id,
+                    current_chat,
+                    scope,
+                    trusted_owner=True,
+                )
                 append_new_message_rows(
                     conn,
                     "messages",
@@ -5100,6 +5349,8 @@ def save_current_chat(
                     saved_chat["messages"],
                     loaded_message_ids,
                     scope,
+                    next_sort_order=current_chat.get("_next_sort_order"),
+                    trusted_owner=True,
                 )
                 current_chat.update(saved_chat)
                 current_chat["_recent_messages_only"] = True
@@ -5108,7 +5359,7 @@ def save_current_chat(
                 ]
             else:
                 upsert_chat_row(conn, profile_id, current_chat, scope)
-    return load_chat_metadata(profile_id)
+    return load_chat_metadata(profile_id) if reload_metadata else []
 
 
 def load_code_chats(profile_id: str) -> list[dict[str, Any]]:
@@ -5129,6 +5380,51 @@ def load_code_chats(profile_id: str) -> list[dict[str, Any]]:
     return sort_chats(chats)
 
 
+def joined_code_chat_rows_to_chat(
+    chat_id: str,
+    rows: list[sqlite3.Row],
+    *,
+    message_limit: int | None = None,
+    project_files: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    first = rows[0]
+    messages: list[dict[str, Any]] = []
+    max_sort_order = None
+    for row in rows:
+        payload = decode_json(row["message_payload"], None)
+        if isinstance(payload, dict):
+            messages.append(payload)
+        try:
+            sort_order = row["message_sort_order"]
+            if sort_order is not None:
+                max_sort_order = max(
+                    int(sort_order),
+                    int(max_sort_order if max_sort_order is not None else sort_order),
+                )
+        except Exception:
+            pass
+
+    chat_item = normalize_chat(
+        {
+            "id": first["id"],
+            "title": first["title"],
+            "summary": first["summary"],
+            "messages": messages,
+            "pinned": bool(first["pinned"]),
+            "created_at": first["created_at"],
+            "updated_at": first["updated_at"],
+        }
+    )
+    if message_limit is not None and message_limit > 0:
+        chat_item["_recent_messages_only"] = True
+        chat_item["_loaded_message_ids"] = [
+            message["id"] for message in chat_item["messages"] if message.get("id")
+        ]
+        chat_item["_next_sort_order"] = int(max_sort_order) + 1 if max_sort_order is not None else 0
+    chat_item["projectFiles"] = project_files or []
+    return ensure_current_chat_shape(chat_id, chat_item, code=True)
+
+
 def load_code_chat_by_id(
     profile_id: str,
     chat_id: str,
@@ -5140,26 +5436,67 @@ def load_code_chat_by_id(
     with db_connect() as conn:
         scope = scope or ownership_scope_for_profile(profile_id, conn)
         owner_clause, owner_params = owner_where(scope)
-        row = conn.execute(
-            f"""
-            SELECT *
-            FROM code_chats
-            WHERE {owner_clause} AND id = ?
-            """,
-            (*owner_params, chat_id),
-        ).fetchone()
-        if row:
-            return ensure_current_chat_shape(
-                chat_id,
-                row_to_code_chat(
-                    conn,
-                    row,
-                    scope,
-                    message_limit=message_limit,
-                    include_project_files=include_project_files,
+        if message_limit is not None:
+            rows = conn.execute(
+                f"""
+                WITH target_chat AS (
+                    SELECT *
+                    FROM code_chats
+                    WHERE {owner_clause} AND id = ?
                 ),
-                code=True,
-            )
+                recent_messages AS (
+                    SELECT payload, sort_order
+                    FROM (
+                        SELECT payload, sort_order
+                        FROM code_messages
+                        WHERE {owner_clause} AND chat_id = ?
+                        ORDER BY sort_order DESC
+                        LIMIT ?
+                    ) AS limited_messages
+                )
+                SELECT target_chat.id, target_chat.title, target_chat.summary,
+                    target_chat.pinned, target_chat.created_at, target_chat.updated_at,
+                    recent_messages.payload AS message_payload,
+                    recent_messages.sort_order AS message_sort_order
+                FROM target_chat
+                LEFT JOIN recent_messages ON 1 = 1
+                ORDER BY recent_messages.sort_order ASC
+                """,
+                (*owner_params, chat_id, *owner_params, chat_id, int(message_limit)),
+            ).fetchall()
+            if rows:
+                project_files = (
+                    load_code_project_files(profile_id, chat_id, conn, scope)
+                    if include_project_files
+                    else []
+                )
+                return joined_code_chat_rows_to_chat(
+                    chat_id,
+                    rows,
+                    message_limit=message_limit,
+                    project_files=project_files,
+                )
+        else:
+            row = conn.execute(
+                f"""
+                SELECT *
+                FROM code_chats
+                WHERE {owner_clause} AND id = ?
+                """,
+                (*owner_params, chat_id),
+            ).fetchone()
+            if row:
+                return ensure_current_chat_shape(
+                    chat_id,
+                    row_to_code_chat(
+                        conn,
+                        row,
+                        scope,
+                        message_limit=message_limit,
+                        include_project_files=include_project_files,
+                    ),
+                    code=True,
+                )
         reject_other_owner_id(conn, "code_chats", chat_id, scope, "code chat")
     return ensure_current_chat_shape(chat_id, {"title": "New Code Chat"}, code=True)
 
@@ -5224,6 +5561,8 @@ def save_current_code_chat(
     profile_id: str,
     chats: list[dict[str, Any]],
     current_chat: dict[str, Any],
+    *,
+    reload_metadata: bool = True,
 ) -> list[dict[str, Any]]:
     current_chat["updated_at"] = now_iso()
     recent_only = bool(current_chat.get("_recent_messages_only"))
@@ -5232,7 +5571,13 @@ def save_current_code_chat(
         with db_connect() as conn:
             scope = ownership_scope_for_profile(profile_id, conn)
             if recent_only:
-                saved_chat = upsert_code_chat_header_row(conn, profile_id, current_chat, scope)
+                saved_chat = upsert_code_chat_header_row(
+                    conn,
+                    profile_id,
+                    current_chat,
+                    scope,
+                    trusted_owner=True,
+                )
                 append_new_message_rows(
                     conn,
                     "code_messages",
@@ -5241,6 +5586,8 @@ def save_current_code_chat(
                     saved_chat["messages"],
                     loaded_message_ids,
                     scope,
+                    next_sort_order=current_chat.get("_next_sort_order"),
+                    trusted_owner=True,
                 )
                 current_chat.update(saved_chat)
                 current_chat["_recent_messages_only"] = True
@@ -5250,7 +5597,7 @@ def save_current_code_chat(
                 current_chat["projectFiles"] = current_chat.get("projectFiles", [])
             else:
                 upsert_code_chat_row(conn, profile_id, current_chat, scope)
-    return load_code_chat_metadata(profile_id)
+    return load_code_chat_metadata(profile_id) if reload_metadata else []
 
 
 def safe_code_file_name(raw_name: str | None, fallback: str = "code.txt") -> str:
@@ -10455,6 +10802,7 @@ def persist_ai_response(
     suggestions: list[str] | None = None,
     use_llm_title: bool = True,
     update_summary: bool = True,
+    reload_metadata: bool = True,
 ) -> list[dict[str, Any]]:
     ai_response = clean_model_output(ai_response)
     current_chat["messages"].append(
@@ -10480,7 +10828,7 @@ def persist_ai_response(
             current_chat["messages"],
         )
 
-    return save_current_chat(profile_id, chats, current_chat)
+    return save_current_chat(profile_id, chats, current_chat, reload_metadata=reload_metadata)
 
 
 def persist_code_response(
@@ -10493,6 +10841,7 @@ def persist_code_response(
     language: str,
     project_files: list[dict[str, Any]] | None = None,
     generated_files: list[dict[str, Any]] | None = None,
+    reload_metadata: bool = True,
 ) -> list[dict[str, Any]]:
     ai_response = clean_model_output(ai_response)
     current_chat["messages"].append(
@@ -10513,7 +10862,7 @@ def persist_code_response(
         current_chat.get("summary", ""),
         current_chat["messages"],
     )
-    return save_current_code_chat(profile_id, chats, current_chat)
+    return save_current_code_chat(profile_id, chats, current_chat, reload_metadata=reload_metadata)
 
 
 def append_user_message(
@@ -11767,6 +12116,7 @@ async def code_chat_stream(
                         "auto",
                         saved_project_files,
                         [],
+                        reload_metadata=False,
                     )
                 finally:
                     finish_stream_persistence(metrics, persist_started)
@@ -11810,6 +12160,7 @@ async def code_chat_stream(
                         language,
                         saved_project_files,
                         [],
+                        reload_metadata=False,
                     )
                 finally:
                     finish_stream_persistence(metrics, persist_started)
@@ -11832,7 +12183,7 @@ async def code_chat_stream(
         project_context, selected_project_files = build_code_project_context(profile_id, chat_id, user_message)
         metrics["context_ms"] = elapsed_ms(context_started)
     relevant_project_files = selected_project_files or saved_project_files
-    log_activity_async(profile_id, "code_request", {"task": task, "language": language})
+    code_activity_detail = {"task": task, "language": language}
     clarification = code_clarification_response(user_message, task, has_project_context=bool(relevant_project_files))
 
     if clarification:
@@ -11860,6 +12211,7 @@ async def code_chat_stream(
                         language,
                         relevant_project_files,
                         [],
+                        reload_metadata=False,
                     )
                 finally:
                     finish_stream_persistence(metrics, persist_started)
@@ -11911,10 +12263,17 @@ async def code_chat_stream(
                     language,
                     relevant_project_files,
                     generated_files,
+                    reload_metadata=False,
                 )
             finally:
                 finish_stream_persistence(metrics, persist_started)
                 log_stream_timing("/code-chat-stream", metrics)
+                log_activity_async(
+                    profile_id,
+                    "code_request",
+                    code_activity_detail,
+                    delay_seconds=GUEST_BACKGROUND_SETUP_DELAY_SECONDS,
+                )
 
         start_stream_persistence_thread(metrics, persist_and_log)
 
@@ -12400,7 +12759,7 @@ async def chat_stream(
         conversation=conversation,
     )
     answer_mode = route["answerMode"]
-    log_activity_async(profile_id, "chat_stream_request", {"intent": intent, "mode": answer_mode, "tool": route["tool"]})
+    chat_activity_detail = {"intent": intent, "mode": answer_mode, "tool": route["tool"]}
     has_history = bool(current_chat.get("messages"))
     clarification = clarification_response(
         user_message,
@@ -12528,10 +12887,17 @@ async def chat_stream(
                     citations=citations,
                     document_hits=document_hits,
                     suggestions=suggestions,
+                    reload_metadata=False,
                 )
             finally:
                 finish_stream_persistence(metrics, persist_started)
                 log_stream_timing("/chat-stream", metrics)
+                log_activity_async(
+                    profile_id,
+                    "chat_stream_request",
+                    chat_activity_detail,
+                    delay_seconds=GUEST_BACKGROUND_SETUP_DELAY_SECONDS,
+                )
 
         start_stream_persistence_thread(metrics, persist_and_log)
 
