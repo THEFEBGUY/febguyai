@@ -14,6 +14,7 @@ import re
 import secrets
 import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -536,13 +537,56 @@ def resolve_device_id(*values: str | None) -> str | None:
         raise HTTPException(status_code=400, detail="Conflicting device IDs.")
     return normalized[0]
 
-if pytesseract is not None:
-    tesseract_cmd = os.getenv(
-        "TESSERACT_CMD",
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-    )
-    if Path(tesseract_cmd).exists():
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+WINDOWS_TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+SCANNED_PDF_OCR_UNAVAILABLE_MESSAGE = (
+    "This appears to be a scanned or image-only PDF. No embedded text was found, "
+    "and OCR is unavailable on this server because the Tesseract executable is "
+    "not installed or is not in PATH."
+)
+PDF_TEXT_UNAVAILABLE_MESSAGE = (
+    "No readable text was found in this PDF. If it is scanned or image-only, OCR is required."
+)
+IMAGE_OCR_UNAVAILABLE_MESSAGE = (
+    "Image OCR is unavailable because the Tesseract executable is not installed or is not in PATH."
+)
+CONVERSION_TIMEOUT_SECONDS = 120
+
+
+def resolve_executable(*candidates: str | None) -> str | None:
+    for candidate in candidates:
+        command = str(candidate or "").strip()
+        if not command:
+            continue
+        if Path(command).exists():
+            return command
+        found = shutil.which(command)
+        if found:
+            return found
+    return None
+
+
+TESSERACT_CMD = resolve_executable(os.getenv("TESSERACT_CMD"), "tesseract", WINDOWS_TESSERACT_CMD)
+PANDOC_CMD = resolve_executable(os.getenv("PANDOC_CMD"), "pandoc")
+PRINCE_CMD = resolve_executable(os.getenv("PRINCE_CMD"), "prince", "princexml")
+
+if pytesseract is not None and TESSERACT_CMD:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+
+
+def ocr_available() -> bool:
+    return pytesseract is not None and bool(TESSERACT_CMD)
+
+
+def cloud_docx_to_pdf_available() -> bool:
+    return bool(OfficePdfTask is not None and ILOVEPDF_PUBLIC_KEY and ILOVEPDF_SECRET_KEY)
+
+
+def cloud_pdf_to_docx_available() -> bool:
+    return bool(PdfOfficeTask is not None and ILOVEPDF_PUBLIC_KEY and ILOVEPDF_SECRET_KEY)
+
+
+def local_docx_to_pdf_available() -> bool:
+    return bool(PANDOC_CMD and PRINCE_CMD)
 
 
 def error_code_for_status(status_code: int) -> str:
@@ -6699,7 +6743,7 @@ def is_calculator_question(message: str) -> bool:
     return trigger and bool(extract_calculation_expression(message))
 
 
-def extract_pdf_content(file_bytes: bytes) -> tuple[str, int, bool, list[str]]:
+def extract_pdf_content(file_bytes: bytes) -> tuple[str, int, bool, list[str], str | None]:
     page_texts: list[str] = []
     page_count = 0
     used_ocr = False
@@ -6714,27 +6758,81 @@ def extract_pdf_content(file_bytes: bytes) -> tuple[str, int, bool, list[str]]:
         page_texts = []
 
     pdf_text = "\n\n".join(text for text in page_texts if text).strip()
-    if pdf_text or fitz is None or pytesseract is None:
-        return pdf_text, page_count, used_ocr, page_texts
+    if pdf_text:
+        return pdf_text, page_count, used_ocr, page_texts, None
+
+    if fitz is not None:
+        pdf_document = None
+        try:
+            pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
+            page_count = max(page_count, len(pdf_document))
+            fitz_page_texts = [
+                (pdf_document[page_number].get_text("text") or "").strip()
+                for page_number in range(len(pdf_document))
+            ]
+            fitz_text = "\n\n".join(text for text in fitz_page_texts if text).strip()
+            if fitz_text:
+                return fitz_text, page_count, used_ocr, fitz_page_texts, None
+        except Exception:
+            pass
+        finally:
+            if pdf_document is not None:
+                pdf_document.close()
+
+    if page_count == 0:
+        return "", page_count, used_ocr, page_texts, "This PDF could not be opened for text extraction."
+
+    if fitz is None:
+        return (
+            "",
+            page_count,
+            used_ocr,
+            page_texts,
+            f"{PDF_TEXT_UNAVAILABLE_MESSAGE} PDF page rendering is unavailable on this server.",
+        )
+
+    if not ocr_available():
+        return "", page_count, used_ocr, page_texts, SCANNED_PDF_OCR_UNAVAILABLE_MESSAGE
 
     used_ocr = True
-    pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
-    page_count = len(pdf_document)
-    page_texts = []
+    pdf_document = None
+    try:
+        pdf_document = fitz.open(stream=file_bytes, filetype="pdf")
+        page_count = len(pdf_document)
+        page_texts = []
 
-    for page_number in range(page_count):
-        page = pdf_document[page_number]
-        pix = page.get_pixmap(dpi=200)
-        image = Image.open(io.BytesIO(pix.tobytes("png")))
-        page_texts.append(pytesseract.image_to_string(image).strip())
+        for page_number in range(page_count):
+            page = pdf_document[page_number]
+            pix = page.get_pixmap(dpi=200)
+            image = Image.open(io.BytesIO(pix.tobytes("png")))
+            page_texts.append(pytesseract.image_to_string(image).strip())
+    except Exception as exc:
+        return (
+            "",
+            page_count,
+            False,
+            [],
+            f"{SCANNED_PDF_OCR_UNAVAILABLE_MESSAGE} OCR failed with: {exc}",
+        )
+    finally:
+        if pdf_document is not None:
+            pdf_document.close()
 
     pdf_text = "\n\n".join(text for text in page_texts if text).strip()
-    return pdf_text, page_count, used_ocr, page_texts
+    if not pdf_text:
+        return (
+            "",
+            page_count,
+            used_ocr,
+            page_texts,
+            "OCR ran, but no readable text was found in this scanned PDF.",
+        )
+    return pdf_text, page_count, used_ocr, page_texts, None
 
 
-def extract_pdf_text(file_bytes: bytes) -> tuple[str, int, bool]:
-    text, page_count, used_ocr, _page_texts = extract_pdf_content(file_bytes)
-    return text, page_count, used_ocr
+def extract_pdf_text(file_bytes: bytes) -> tuple[str, int, bool, str | None]:
+    text, page_count, used_ocr, _page_texts, notice = extract_pdf_content(file_bytes)
+    return text, page_count, used_ocr, notice
 
 
 def chunk_pdf_pages(page_texts: list[str]) -> list[dict[str, Any]]:
@@ -6850,15 +6948,15 @@ def create_simple_docx_from_text(text: str, output_path: Path, title: str) -> No
         )
 
 
-def extract_image_text(file_path: Path) -> str:
-    if pytesseract is None:
-        return "Image OCR unavailable because pytesseract is not installed."
+def extract_image_text(file_path: Path) -> tuple[str, bool, str | None]:
+    if not ocr_available():
+        return "", False, IMAGE_OCR_UNAVAILABLE_MESSAGE
 
     try:
         image = Image.open(file_path)
-        return pytesseract.image_to_string(image).strip()
+        return pytesseract.image_to_string(image).strip(), True, None
     except Exception as exc:
-        return f"Image OCR failed: {exc}"
+        return "", True, f"Image OCR failed: {exc}"
 
 
 def encode_image_base64(file_path: Path) -> str | None:
@@ -7016,16 +7114,18 @@ def extract_file_context(
 
     try:
         if suffix == ".pdf" or "pdf" in file_type_lower:
-            text, page_count, used_ocr, page_texts = extract_pdf_content(file_path.read_bytes())
+            text, page_count, used_ocr, page_texts, notice = extract_pdf_content(file_path.read_bytes())
             metadata["page_count"] = page_count
             metadata["used_ocr"] = used_ocr
             metadata["raw_text"] = text
             metadata["chunks"] = chunk_pdf_pages(page_texts) or chunk_text(text)
+            notice_block = f"\n\n{notice}" if notice and not text.strip() else ""
             metadata["context"] = (
                 f"Uploaded PDF: {file_name}\n"
                 f"Pages: {page_count}\n"
                 f"OCR used: {'yes' if used_ocr else 'no'}\n\n"
                 f"{clip_text(text)}"
+                f"{notice_block}"
             )
 
         elif suffix == ".docx":
@@ -7047,14 +7147,16 @@ def extract_file_context(
             ".webp",
             ".bmp",
         }:
-            text = extract_image_text(file_path)
+            text, used_ocr, notice = extract_image_text(file_path)
             metadata["is_image"] = True
-            metadata["used_ocr"] = True
+            metadata["used_ocr"] = used_ocr
             metadata["raw_text"] = text
             metadata["chunks"] = chunk_text(text)
+            notice_block = f"\n\n{notice}" if notice and not text.strip() else ""
             metadata["context"] = (
                 f"Uploaded image: {file_name}\n"
                 f"OCR text, if any:\n{clip_text(text, 4000)}"
+                f"{notice_block}"
             )
 
         else:
@@ -7296,6 +7398,9 @@ def document_hit(
     preview: str = "",
 ) -> dict[str, Any]:
     chunk = chunk or {}
+    default_preview = chunk.get("preview") or clip_text(chunk.get("text", ""), 180)
+    if not default_preview and document.get("text_unavailable"):
+        default_preview = clip_text(document.get("context", ""), 180)
     return {
         **chunk,
         "document_id": document.get("document_id"),
@@ -7306,7 +7411,7 @@ def document_hit(
         "ocr_uncertain": bool(document.get("ocr_uncertain")),
         "text_unavailable": bool(document.get("text_unavailable")),
         "is_image": bool(document.get("is_image")),
-        "preview": preview or chunk.get("preview") or clip_text(chunk.get("text", ""), 180),
+        "preview": preview or default_preview,
     }
 
 
@@ -7462,7 +7567,7 @@ def build_file_context_from_chat(
         if document.get("is_image") and document.get("text_unavailable"):
             ocr_note = " (visual image supplied; OCR text is unavailable or empty)"
         elif document.get("text_unavailable"):
-            ocr_note = " (no readable text was extracted; OCR may be unavailable or failed)"
+            ocr_note = f" ({SCANNED_PDF_OCR_UNAVAILABLE_MESSAGE})"
         elif document.get("used_ocr"):
             ocr_note = " (OCR-derived text; quality may require verification)"
         context.append(f"- {document.get('name', 'Uploaded file')}{ocr_note}")
@@ -7503,6 +7608,116 @@ def detect_document_intent(file_name: str, prompt: str) -> str | None:
     return None
 
 
+def pdf_to_docx_text_fallback(
+    profile_id: str,
+    file_path: Path,
+    filename: str,
+    output_folder: Path,
+    output_id: str,
+    output_name: str,
+    *,
+    cloud_error: Exception | None = None,
+) -> dict[str, Any]:
+    text, _page_count, used_ocr, notice = extract_pdf_text(file_path.read_bytes())
+    if not text.strip():
+        prefix = "Cloud PDF to DOCX conversion failed, and " if cloud_error else ""
+        return {
+            "success": False,
+            "message": (
+                f"{prefix}{notice or PDF_TEXT_UNAVAILABLE_MESSAGE} "
+                "Text-based PDF to DOCX conversion can run without OCR, but scanned PDFs need OCR."
+            ),
+        }
+
+    output_file_path = output_folder / output_name
+    create_simple_docx_from_text(text, output_file_path, Path(filename).stem)
+    save_owned_file_record(
+        profile_id,
+        output_file_path,
+        output_name,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+    if cloud_error:
+        message = (
+            "Cloud PDF to DOCX conversion failed, so a text-based DOCX fallback was created. "
+            "Complex layouts may not match the original exactly."
+        )
+    elif used_ocr:
+        message = (
+            "PDF converted to a DOCX using OCR-derived text. "
+            "Please verify unclear details and complex layouts."
+        )
+    else:
+        message = (
+            "PDF converted to a text-based DOCX. "
+            "Complex layouts may not match the original exactly."
+        )
+    return {
+        "success": True,
+        "file_name": output_name,
+        "download_url": f"{API_PUBLIC_BASE_URL}/download/{output_id}/{output_name}",
+        "message": message,
+    }
+
+
+def docx_to_pdf_local_fallback(
+    profile_id: str,
+    file_path: Path,
+    output_folder: Path,
+    output_id: str,
+    output_name: str,
+    *,
+    cloud_error: Exception | None = None,
+) -> dict[str, Any] | None:
+    if not local_docx_to_pdf_available():
+        return None
+
+    output_file_path = output_folder / output_name
+    try:
+        result = subprocess.run(
+            [
+                PANDOC_CMD,
+                str(file_path),
+                f"--pdf-engine={PRINCE_CMD}",
+                "-o",
+                str(output_file_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=CONVERSION_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "message": "DOCX to PDF conversion timed out while running the local converter.",
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": f"DOCX to PDF conversion could not start the local converter: {exc}",
+        }
+
+    if result.returncode != 0 or not output_file_path.exists():
+        detail = clip_text((result.stderr or result.stdout or "").strip(), 300)
+        detail_suffix = f" {detail}" if detail else ""
+        return {
+            "success": False,
+            "message": f"DOCX to PDF conversion failed in the local converter.{detail_suffix}",
+        }
+
+    save_owned_file_record(profile_id, output_file_path, output_name, "application/pdf")
+    message = "DOCX converted to PDF."
+    if cloud_error:
+        message = "Cloud DOCX to PDF conversion failed, so the local Render converter created the PDF."
+    return {
+        "success": True,
+        "file_name": output_name,
+        "download_url": f"{API_PUBLIC_BASE_URL}/download/{output_id}/{output_name}",
+        "message": message,
+    }
+
+
 def process_document_tool(
     profile_id: str,
     file_path: Path,
@@ -7517,43 +7732,46 @@ def process_document_tool(
     output_id = str(uuid.uuid4())
     output_folder = ensure_controlled_file_path(PROCESSED_DIR / output_id)
     output_folder.mkdir(parents=True, exist_ok=True)
+    output_name = ""
 
     try:
         if intent == "docx_to_pdf":
-            if not ILOVEPDF_PUBLIC_KEY or not ILOVEPDF_SECRET_KEY:
+            output_name = f"{Path(filename).stem}.pdf"
+            if not cloud_docx_to_pdf_available():
+                local_result = docx_to_pdf_local_fallback(
+                    profile_id,
+                    file_path,
+                    output_folder,
+                    output_id,
+                    output_name,
+                )
+                if local_result is not None:
+                    return local_result
                 return {
                     "success": False,
-                    "message": "DOCX to PDF conversion needs ILOVEPDF_PUBLIC_KEY and ILOVEPDF_SECRET_KEY in .env.",
-                }
-            if OfficePdfTask is None:
-                return {
-                    "success": False,
-                    "message": "DOCX to PDF conversion is unavailable because OfficePdfTask could not be imported.",
+                    "message": (
+                        "DOCX to PDF conversion needs either ILOVEPDF_PUBLIC_KEY and "
+                        "ILOVEPDF_SECRET_KEY, or local pandoc and prince/princexml executables. "
+                        "Render native Python deploys include pandoc and princexml; if those are "
+                        "not available, configure iLovePDF credentials or deploy the backend with Docker."
+                    ),
                 }
             task = OfficePdfTask(
                 public_key=ILOVEPDF_PUBLIC_KEY,
                 secret_key=ILOVEPDF_SECRET_KEY,
             )
-            output_name = f"{Path(filename).stem}.pdf"
 
         elif intent == "pdf_to_docx":
             output_name = f"{Path(filename).stem}.docx"
-            if PdfOfficeTask is None or not (ILOVEPDF_PUBLIC_KEY and ILOVEPDF_SECRET_KEY):
-                text, _page_count, _used_ocr = extract_pdf_text(file_path.read_bytes())
-                output_file_path = output_folder / output_name
-                create_simple_docx_from_text(text, output_file_path, Path(filename).stem)
-                save_owned_file_record(
+            if not cloud_pdf_to_docx_available():
+                return pdf_to_docx_text_fallback(
                     profile_id,
-                    output_file_path,
+                    file_path,
+                    filename,
+                    output_folder,
+                    output_id,
                     output_name,
-                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 )
-                return {
-                    "success": True,
-                    "file_name": output_name,
-                    "download_url": f"{API_PUBLIC_BASE_URL}/download/{output_id}/{output_name}",
-                    "message": "PDF converted to a text-based DOCX. Complex layouts may not match the original exactly.",
-                }
             task = PdfOfficeTask(
                 public_key=ILOVEPDF_PUBLIC_KEY,
                 secret_key=ILOVEPDF_SECRET_KEY,
@@ -7584,6 +7802,27 @@ def process_document_tool(
         }
 
     except Exception as exc:
+        if intent == "pdf_to_docx" and output_name:
+            return pdf_to_docx_text_fallback(
+                profile_id,
+                file_path,
+                filename,
+                output_folder,
+                output_id,
+                output_name,
+                cloud_error=exc,
+            )
+        if intent == "docx_to_pdf" and output_name:
+            local_result = docx_to_pdf_local_fallback(
+                profile_id,
+                file_path,
+                output_folder,
+                output_id,
+                output_name,
+                cloud_error=exc,
+            )
+            if local_result is not None:
+                return local_result
         return {
             "success": False,
             "message": f"Document conversion failed: {exc}",
@@ -11206,10 +11445,13 @@ def health() -> dict[str, Any]:
         "stt_model": STT_MODEL,
         **models,
         "search_available": DDGS is not None,
-        "ocr_available": pytesseract is not None,
-        "docx_pdf_available": OfficePdfTask is not None,
+        "ocr_available": ocr_available(),
+        "ocr_python_package_available": pytesseract is not None,
+        "tesseract_cmd": TESSERACT_CMD,
+        "docx_pdf_available": cloud_docx_to_pdf_available() or local_docx_to_pdf_available(),
+        "docx_pdf_mode": "cloud" if cloud_docx_to_pdf_available() else "local-pandoc-prince" if local_docx_to_pdf_available() else "unavailable",
         "pdf_docx_available": True,
-        "pdf_docx_mode": "cloud" if PdfOfficeTask is not None and ILOVEPDF_PUBLIC_KEY and ILOVEPDF_SECRET_KEY else "text-fallback",
+        "pdf_docx_mode": "cloud" if cloud_pdf_to_docx_available() else "text-fallback",
         "device_id_support": True,
         "guest_mode_support": True,
         "guest_limits_support": True,
