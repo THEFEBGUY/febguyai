@@ -36,6 +36,8 @@ import {
   X as CloseIcon
 } from "lucide-react";
 import "./index.css";
+import MobileNavDrawer from "./components/mobile/MobileNavDrawer";
+import MobileTopBar from "./components/mobile/MobileTopBar";
 import { supabase, supabaseConfigured } from "./supabaseClient";
 
 const DEFAULT_API_BASE = import.meta.env?.VITE_API_BASE_URL || "http://127.0.0.1:8000";
@@ -472,6 +474,10 @@ function App() {
   const [profiles, setProfiles] = useState([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [sidebarRecentOpen, setSidebarRecentOpen] = useState(false);
+  const [isMobileViewport, setIsMobileViewport] = useState(() => (
+    typeof window !== "undefined" ? window.innerWidth < 1024 : false
+  ));
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
   const [authMode, setAuthMode] = useState("login");
   const [profileName, setProfileName] = useState("");
   const [selectedProfileId, setSelectedProfileId] = useState("");
@@ -587,6 +593,13 @@ function App() {
   const codeChatRef = useRef([]);
   const copiedStateTimerRef = useRef(null);
   const speechRequestRef = useRef(0);
+  const pendingComposerAttachmentRef = useRef({
+    workspace: "",
+    selectedFile: null,
+    selectedCodeFiles: [],
+    filePreview: null
+  });
+  const filePickerActiveRef = useRef(false);
 
   const isCodeWorkspace = workspace === "code";
   const activeMessages = isCodeWorkspace ? codeChat : chat;
@@ -594,6 +607,65 @@ function App() {
   const activeId = isCodeWorkspace ? activeCodeChatId : activeChatId;
   const activeCodeChatItem = codeChats.find(item => item.id === activeCodeChatId);
   const activeCodeProjectFiles = activeCodeChatItem?.projectFiles || [];
+  const closeMobileDrawer = useCallback(() => setMobileDrawerOpen(false), []);
+  const openMobileDrawer = useCallback(() => setMobileDrawerOpen(true), []);
+
+  useEffect(() => {
+    const updateMobileViewport = () => {
+      setIsMobileViewport(window.innerWidth < 1024);
+    };
+
+    updateMobileViewport();
+    window.addEventListener("resize", updateMobileViewport);
+    window.addEventListener("orientationchange", updateMobileViewport);
+    return () => {
+      window.removeEventListener("resize", updateMobileViewport);
+      window.removeEventListener("orientationchange", updateMobileViewport);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isMobileViewport) {
+      setMobileDrawerOpen(false);
+    }
+  }, [isMobileViewport]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") {
+      return undefined;
+    }
+
+    if (!isMobileViewport) {
+      document.documentElement.style.removeProperty("--fg-keyboard-inset");
+      return undefined;
+    }
+
+    const root = document.documentElement;
+    const viewport = window.visualViewport;
+    const updateKeyboardInset = () => {
+      if (!viewport) {
+        root.style.setProperty("--fg-keyboard-inset", "0px");
+        return;
+      }
+
+      const keyboardInset = Math.max(0, window.innerHeight - viewport.height - viewport.offsetTop);
+      root.style.setProperty("--fg-keyboard-inset", `${Math.round(keyboardInset)}px`);
+    };
+
+    updateKeyboardInset();
+    viewport?.addEventListener("resize", updateKeyboardInset);
+    viewport?.addEventListener("scroll", updateKeyboardInset);
+    window.addEventListener("resize", updateKeyboardInset);
+    window.addEventListener("orientationchange", updateKeyboardInset);
+
+    return () => {
+      viewport?.removeEventListener("resize", updateKeyboardInset);
+      viewport?.removeEventListener("scroll", updateKeyboardInset);
+      window.removeEventListener("resize", updateKeyboardInset);
+      window.removeEventListener("orientationchange", updateKeyboardInset);
+      root.style.removeProperty("--fg-keyboard-inset");
+    };
+  }, [isMobileViewport]);
 
   useEffect(() => {
     activeChatIdRef.current = activeChatId;
@@ -1172,6 +1244,59 @@ function App() {
     }
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [activeMessages, workspace, loading, processingFile]);
+
+  useEffect(() => {
+    pendingComposerAttachmentRef.current = {
+      workspace,
+      selectedFile,
+      selectedCodeFiles,
+      filePreview
+    };
+  }, [filePreview, selectedCodeFiles, selectedFile, workspace]);
+
+  const restorePendingComposerAttachment = useCallback(() => {
+    const pending = pendingComposerAttachmentRef.current;
+    filePickerActiveRef.current = false;
+
+    if (!pending || pending.workspace !== workspace) {
+      return;
+    }
+
+    if (!isCodeWorkspace && pending.selectedFile && !selectedFile) {
+      setSelectedFile(pending.selectedFile);
+      setSelectedCodeFiles([]);
+      setFilePreview(pending.filePreview || null);
+      if (pending.filePreview) {
+        previewUrlRef.current = pending.filePreview;
+      }
+    }
+
+    if (isCodeWorkspace && pending.selectedCodeFiles?.length && selectedCodeFiles.length === 0) {
+      setSelectedCodeFiles(pending.selectedCodeFiles);
+      setSelectedFile(null);
+      setFilePreview(null);
+    }
+  }, [isCodeWorkspace, selectedCodeFiles.length, selectedFile, workspace]);
+
+  useEffect(() => {
+    const handleReturnFromPicker = () => {
+      if (document.visibilityState === "hidden") {
+        return;
+      }
+
+      window.setTimeout(restorePendingComposerAttachment, 0);
+    };
+
+    window.addEventListener("focus", handleReturnFromPicker);
+    window.addEventListener("pageshow", handleReturnFromPicker);
+    document.addEventListener("visibilitychange", handleReturnFromPicker);
+
+    return () => {
+      window.removeEventListener("focus", handleReturnFromPicker);
+      window.removeEventListener("pageshow", handleReturnFromPicker);
+      document.removeEventListener("visibilitychange", handleReturnFromPicker);
+    };
+  }, [restorePendingComposerAttachment]);
 
   useEffect(() => {
     const textarea = composerRef.current;
@@ -2228,13 +2353,21 @@ function App() {
 
   const handleFileSelect = (event) => {
     const files = Array.from(event.target.files || []);
+    filePickerActiveRef.current = false;
 
     if (!files.length) {
       return;
     }
 
     if (isCodeWorkspace) {
-      setSelectedCodeFiles(files.slice(0, MAX_CODE_FILES_PER_TURN));
+      const nextCodeFiles = files.slice(0, MAX_CODE_FILES_PER_TURN);
+      pendingComposerAttachmentRef.current = {
+        workspace,
+        selectedFile: null,
+        selectedCodeFiles: nextCodeFiles,
+        filePreview: null
+      };
+      setSelectedCodeFiles(nextCodeFiles);
       setSelectedFile(null);
       setPreviewUrl(null);
       setEditingTurn(null);
@@ -2243,25 +2376,45 @@ function App() {
     }
 
     const file = files[0];
+    const nextPreviewUrl = file.type.startsWith("image/") ? URL.createObjectURL(file) : null;
+    pendingComposerAttachmentRef.current = {
+      workspace,
+      selectedFile: file,
+      selectedCodeFiles: [],
+      filePreview: nextPreviewUrl
+    };
     setSelectedFile(file);
     setSelectedCodeFiles([]);
     setEditingTurn(null);
     setAppError("");
-
-    if (file.type.startsWith("image/")) {
-      setPreviewUrl(URL.createObjectURL(file));
-    } else {
-      setPreviewUrl(null);
-    }
+    setPreviewUrl(nextPreviewUrl);
   };
 
   const resetFileInput = () => {
+    filePickerActiveRef.current = false;
+    pendingComposerAttachmentRef.current = {
+      workspace,
+      selectedFile: null,
+      selectedCodeFiles: [],
+      filePreview: null
+    };
     setSelectedFile(null);
     setSelectedCodeFiles([]);
     setPreviewUrl(null);
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
+    }
+  };
+
+  const openComposerFilePicker = () => {
+    filePickerActiveRef.current = true;
+    setComposerUploadMenuOpen(false);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+      fileInputRef.current.click();
+    } else {
+      filePickerActiveRef.current = false;
     }
   };
 
@@ -3357,9 +3510,77 @@ function App() {
     }
   };
 
+  const copyWithTextAreaFallback = (text) => {
+    if (typeof document === "undefined") {
+      return false;
+    }
+
+    const textArea = document.createElement("textarea");
+    const selection = document.getSelection?.();
+    const previousRange = selection?.rangeCount ? selection.getRangeAt(0) : null;
+    textArea.value = text;
+    textArea.setAttribute("readonly", "");
+    textArea.style.position = "fixed";
+    textArea.style.inset = "0 auto auto 0";
+    textArea.style.width = "1px";
+    textArea.style.height = "1px";
+    textArea.style.opacity = "0";
+    textArea.style.pointerEvents = "none";
+    document.body.appendChild(textArea);
+
+    try {
+      textArea.focus({ preventScroll: true });
+    } catch {
+      textArea.focus();
+    }
+    textArea.select();
+    textArea.setSelectionRange(0, textArea.value.length);
+
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+
+    document.body.removeChild(textArea);
+    if (selection && previousRange) {
+      selection.removeAllRanges();
+      selection.addRange(previousRange);
+    }
+    return copied;
+  };
+
+  const writeClipboardText = async (text) => {
+    const normalizedText = String(text ?? "");
+
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
+      try {
+        await navigator.clipboard.writeText(normalizedText);
+        return true;
+      } catch {
+        // Fall through to the legacy path for mobile browsers and local IP testing.
+      }
+    }
+
+    if (copyWithTextAreaFallback(normalizedText)) {
+      return true;
+    }
+
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(normalizedText);
+      return true;
+    }
+
+    return false;
+  };
+
   const copyMessage = async (text, messageKey = "") => {
     try {
-      await navigator.clipboard.writeText(text || "");
+      const copied = await writeClipboardText(text);
+      if (!copied) {
+        throw new Error("Copy failed");
+      }
       if (messageKey) {
         setCopiedMessageKey(messageKey);
         if (copiedStateTimerRef.current) {
@@ -3367,6 +3588,7 @@ function App() {
         }
         copiedStateTimerRef.current = window.setTimeout(() => setCopiedMessageKey(""), 1500);
       }
+      setAppError(current => current === "Could not copy message." ? "" : current);
     } catch {
       setAppError("Could not copy message.");
     }
@@ -4537,6 +4759,47 @@ function App() {
   const selectedProfile = profiles.find(item => item.id === selectedProfileId) || profiles[0] || null;
   const selectedModelMode = modelModeOptions.find(option => option.value === modelMode) || modelModeOptions[1];
   const selectedResponseMode = responseModeOptions.find(option => option.value === responseMode) || responseModeOptions[0];
+  const mobileProfileName = sessionMode === "guest" ? "Guest workspace" : profile?.name || "Profile";
+  const handleMobileNewChat = () => {
+    closeMobileDrawer();
+    setSidebarRecentOpen(false);
+    createNewChat();
+  };
+  const handleMobileSwitchWorkspace = (nextWorkspace) => {
+    closeMobileDrawer();
+    switchWorkspace(nextWorkspace);
+  };
+  const handleMobileOpenChat = (chatItem) => {
+    closeMobileDrawer();
+    openChat(chatItem);
+  };
+  const handleMobileTogglePinChat = (chatItem) => {
+    togglePinChat(chatItem);
+  };
+  const handleMobileRenameChat = (chatItem) => {
+    closeMobileDrawer();
+    renameChat(chatItem);
+  };
+  const handleMobileExportChat = (chatItem) => {
+    closeMobileDrawer();
+    exportChat(chatItem);
+  };
+  const handleMobileDeleteChat = (chatItem) => {
+    closeMobileDrawer();
+    deleteChat(chatItem);
+  };
+  const handleMobileSettings = () => {
+    closeMobileDrawer();
+    setActivePanel("settings");
+  };
+  const handleMobileSignIn = () => {
+    closeMobileDrawer();
+    openAccountSignIn();
+  };
+  const handleMobileSwitchProfile = () => {
+    closeMobileDrawer();
+    switchProfile();
+  };
 
   if (bootstrapping) {
     return renderLoadingScreen();
@@ -4555,7 +4818,37 @@ function App() {
   }
 
   return (
-    <div className={`app-shell theme-${settings.theme} ${isCodeWorkspace ? "workspace-code" : "workspace-chat"} ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
+    <div className={`app-shell theme-${settings.theme} ${isCodeWorkspace ? "workspace-code" : "workspace-chat"} ${sidebarCollapsed ? "sidebar-collapsed" : ""} ${isMobileViewport ? "fg-mobile-enabled" : ""}`}>
+      {isMobileViewport && (
+        <>
+          <MobileTopBar
+            isCodeWorkspace={isCodeWorkspace}
+            onOpenMenu={openMobileDrawer}
+          />
+          <MobileNavDrawer
+            activeChatId={activeId}
+            chats={activeChats}
+            getChatSubtitle={getChatSubtitle}
+            isAccountProfile={isAccountProfile}
+            isCodeWorkspace={isCodeWorkspace}
+            onClose={closeMobileDrawer}
+            onDeleteChat={handleMobileDeleteChat}
+            onExportChat={handleMobileExportChat}
+            onNewChat={handleMobileNewChat}
+            onOpenChat={handleMobileOpenChat}
+            onRenameChat={handleMobileRenameChat}
+            onSettings={handleMobileSettings}
+            onSignIn={handleMobileSignIn}
+            onSwitchProfile={handleMobileSwitchProfile}
+            onSwitchWorkspace={handleMobileSwitchWorkspace}
+            onTogglePinChat={handleMobileTogglePinChat}
+            open={mobileDrawerOpen}
+            profileName={mobileProfileName}
+            sessionMode={sessionMode}
+          />
+        </>
+      )}
+
       <aside className="sidebar" aria-label="Workspace sidebar" aria-expanded={!sidebarCollapsed}>
         <div className="brand">
           <BrandLogo />
@@ -5143,6 +5436,9 @@ function App() {
           className={`input-dock febguy-composer ${isCodeWorkspace ? "code-input" : ""}`}
           onSubmit={(event) => {
             event.preventDefault();
+            if (filePickerActiveRef.current) {
+              return;
+            }
             setComposerModelMenuOpen(false);
             setComposerUploadMenuOpen(false);
             sendMessage();
@@ -5186,9 +5482,10 @@ function App() {
                   <button
                     type="button"
                     role="menuitem"
-                    onClick={() => {
-                      setComposerUploadMenuOpen(false);
-                      fileInputRef.current?.click();
+                    onClick={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      openComposerFilePicker();
                     }}
                   >
                     {isCodeWorkspace ? <CodeFileIcon /> : <AttachIcon />}
