@@ -55,6 +55,10 @@ const RESPONSE_FEEDBACK_KEY = "febguy_response_feedback";
 const GUEST_LIMIT_MESSAGE = "You\u2019ve reached the guest limit. Sign in to continue.";
 const META_PREFIX = "\n\n[[FEBGUY_META:";
 const META_SUFFIX = "]]";
+const MAX_AUTH_EMAIL_CHARS = 254;
+const OTP_CODE_LENGTH = 6;
+const OTP_COOLDOWN_SECONDS = 60;
+const PIN_MIN_LENGTH = 4;
 const answerLengthOptions = ["short", "standard", "detailed"];
 const modelModeOptions = [
   { value: "fast", label: "Fast" },
@@ -125,6 +129,27 @@ function formatClientError(error, fallback = "Something went wrong.") {
     return "Backend unavailable. Start the FastAPI backend and check the app URL.";
   }
   return message || fallback;
+}
+
+function normalizeAuthEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+function isValidAuthEmail(email) {
+  const normalized = normalizeAuthEmail(email);
+  return (
+    normalized.length > 0
+    && normalized.length <= MAX_AUTH_EMAIL_CHARS
+    && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized)
+  );
+}
+
+function sanitizeOtpCode(value) {
+  return String(value || "").replace(/\D/g, "").slice(0, OTP_CODE_LENGTH);
+}
+
+function isValidOtpCode(value) {
+  return new RegExp(`^\\d{${OTP_CODE_LENGTH}}$`).test(String(value || ""));
 }
 
 function isGuestLimitMessage(message) {
@@ -490,8 +515,11 @@ function App() {
   const [accountSelectingProfile, setAccountSelectingProfile] = useState(false);
   const [accountIdentity, setAccountIdentity] = useState(null);
   const [accountEmail, setAccountEmail] = useState("");
+  const [accountOtp, setAccountOtp] = useState("");
   const [accountAuthLoading, setAccountAuthLoading] = useState(false);
-  const [emailLinkSent, setEmailLinkSent] = useState(false);
+  const [emailOtpSent, setEmailOtpSent] = useState(false);
+  const [emailOtpCooldown, setEmailOtpCooldown] = useState(0);
+  const [emailOtpStatus, setEmailOtpStatus] = useState("");
   const [bootstrapping, setBootstrapping] = useState(true);
   const [profileLoading, setProfileLoading] = useState(false);
 
@@ -541,10 +569,11 @@ function App() {
   const [pinResetCode, setPinResetCode] = useState("");
   const [pinResetNewPin, setPinResetNewPin] = useState("");
   const [pinResetConfirmPin, setPinResetConfirmPin] = useState("");
+  const [pinResetProofToken, setPinResetProofToken] = useState("");
+  const [pinResetCooldown, setPinResetCooldown] = useState(0);
   const [pinResetBusy, setPinResetBusy] = useState(false);
   const [pinResetError, setPinResetError] = useState("");
   const [pinResetInfo, setPinResetInfo] = useState("");
-  const [pinResetDevCode, setPinResetDevCode] = useState("");
 
   const [selectedFile, setSelectedFile] = useState(null);
   const [filePreview, setFilePreview] = useState(null);
@@ -623,6 +652,30 @@ function App() {
       window.removeEventListener("orientationchange", updateMobileViewport);
     };
   }, []);
+
+  useEffect(() => {
+    if (emailOtpCooldown <= 0) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(() => {
+      setEmailOtpCooldown(current => Math.max(0, current - 1));
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [emailOtpCooldown]);
+
+  useEffect(() => {
+    if (pinResetCooldown <= 0) {
+      return undefined;
+    }
+
+    const timer = window.setInterval(() => {
+      setPinResetCooldown(current => Math.max(0, current - 1));
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [pinResetCooldown]);
 
   useEffect(() => {
     if (!isMobileViewport) {
@@ -1412,6 +1465,11 @@ function App() {
     setProfiles([]);
     setLegacyLoginEnabled(false);
     setAuthMode("login");
+    setAccountEmail("");
+    setAccountOtp("");
+    setEmailOtpSent(false);
+    setEmailOtpStatus("");
+    setEmailOtpCooldown(0);
   };
 
   const openAccountSignIn = async () => {
@@ -1508,9 +1566,9 @@ function App() {
     setPinResetCode("");
     setPinResetNewPin("");
     setPinResetConfirmPin("");
+    setPinResetProofToken("");
     setPinResetError("");
     setPinResetInfo("");
-    setPinResetDevCode("");
     setPinResetOpen(true);
   };
 
@@ -1521,50 +1579,104 @@ function App() {
     setPinResetOpen(false);
     setPinResetError("");
     setPinResetInfo("");
-    setPinResetDevCode("");
+    setPinResetProofToken("");
   };
 
   const startPinReset = async () => {
     if (!selectedProfileId || pinResetBusy) {
       return;
     }
+    if (pinResetCooldown > 0) {
+      setPinResetInfo(`You can request another code in ${pinResetCooldown}s.`);
+      return;
+    }
+
+    if (!supabaseConfigured || !supabase) {
+      setPinResetError("Account verification is not configured yet.");
+      return;
+    }
+
+    const email = normalizeAuthEmail(accountIdentity?.email);
+    if (!isValidAuthEmail(email)) {
+      setPinResetError("Sign in again before resetting this profile PIN.");
+      return;
+    }
+
     setPinResetBusy(true);
     setPinResetError("");
     setPinResetInfo("");
-    setPinResetDevCode("");
+    setPinResetProofToken("");
     try {
-      const data = await requestJson("/profiles/pin-reset/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profile_id: selectedProfileId })
+      const { error } = await supabase.auth.signInWithOtp({
+        email,
+        options: {
+          emailRedirectTo: window.location.origin,
+          shouldCreateUser: false
+        }
       });
-      setPinResetInfo(data.message || "Verification code prepared for your signed-in email.");
-      setPinResetDevCode(data.dev_code || "");
+
+      if (error) {
+        throw error;
+      }
+
+      setPinResetCooldown(OTP_COOLDOWN_SECONDS);
+      setPinResetInfo("If this profile belongs to your signed-in account, a verification code was sent.");
       setPinResetStep("verify");
     } catch (error) {
-      setPinResetError(formatClientError(error, "Could not start PIN reset."));
+      setPinResetError("Could not send a verification code. Please wait and try again.");
     } finally {
       setPinResetBusy(false);
     }
   };
 
+  const resendPinResetOtp = async () => {
+    await startPinReset();
+  };
+
   const verifyPinReset = async (event) => {
     event.preventDefault();
-    if (!pinResetCode.trim() || pinResetBusy) {
+    const code = sanitizeOtpCode(pinResetCode);
+    const email = normalizeAuthEmail(accountIdentity?.email);
+    if (pinResetBusy) {
       return;
     }
+    if (!isValidOtpCode(code)) {
+      setPinResetError(`Enter the ${OTP_CODE_LENGTH}-digit verification code.`);
+      return;
+    }
+    if (!isValidAuthEmail(email) || !supabaseConfigured || !supabase) {
+      setPinResetError("Sign in again before resetting this profile PIN.");
+      return;
+    }
+
     setPinResetBusy(true);
     setPinResetError("");
     try {
-      await requestJson("/profiles/pin-reset/verify", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ profile_id: selectedProfileId, code: pinResetCode })
+      const { data, error } = await supabase.auth.verifyOtp({
+        email,
+        token: code,
+        type: "email"
       });
+      if (error) {
+        throw error;
+      }
+
+      const authSession = data?.session || (await supabase.auth.getSession())?.data?.session;
+      const accessToken = authSession?.access_token;
+      if (!accessToken) {
+        throw new Error("Verification did not return an account session.");
+      }
+
+      const exchanged = await exchangeSupabaseAccountSession(authSession);
+      if (!exchanged) {
+        throw new Error("Account verification could not be completed.");
+      }
+
+      setPinResetProofToken(accessToken);
       setPinResetStep("new-pin");
-      setPinResetInfo("Code confirmed. Choose a new PIN for this profile.");
+      setPinResetInfo("Account verified. Choose a new PIN for this profile.");
     } catch (error) {
-      setPinResetError(formatClientError(error, "Verification code could not be confirmed."));
+      setPinResetError("Verification code could not be confirmed.");
     } finally {
       setPinResetBusy(false);
     }
@@ -1576,8 +1688,12 @@ function App() {
       setPinResetError("New PIN and confirmation do not match.");
       return;
     }
-    if (pinResetNewPin.trim().length < 4) {
-      setPinResetError("New PIN must be at least 4 characters.");
+    if (pinResetNewPin.trim().length < PIN_MIN_LENGTH) {
+      setPinResetError(`New PIN must be at least ${PIN_MIN_LENGTH} characters.`);
+      return;
+    }
+    if (!pinResetProofToken) {
+      setPinResetError("Verify your account before setting a new PIN.");
       return;
     }
     setPinResetBusy(true);
@@ -1588,7 +1704,7 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           profile_id: selectedProfileId,
-          code: pinResetCode,
+          account_access_token: pinResetProofToken,
           new_pin: pinResetNewPin
         })
       });
@@ -1597,6 +1713,7 @@ function App() {
       setPinResetCode("");
       setPinResetNewPin("");
       setPinResetConfirmPin("");
+      setPinResetProofToken("");
       if (data.token && data.profile) {
         await enterAuthenticatedSession(
           data.token,
@@ -1708,7 +1825,9 @@ function App() {
 
   const signInWithGoogle = async () => {
     setAuthError("");
-    setEmailLinkSent(false);
+    setEmailOtpSent(false);
+    setEmailOtpStatus("");
+    setAccountOtp("");
 
     if (!supabaseConfigured || !supabase) {
       setAuthError("Account sign-in is not configured yet. Add the public Supabase settings and restart the frontend.");
@@ -1718,50 +1837,132 @@ function App() {
     setAccountAuthLoading(true);
     window.localStorage.setItem(SKIP_GUEST_AUTO_START_KEY, "true");
 
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider: "google",
-      options: { redirectTo: window.location.origin }
-    });
+    try {
+      const { error } = await supabase.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: window.location.origin }
+      });
+
+      if (error) {
+        setAccountAuthLoading(false);
+        setAuthError(error.message || "Google sign-in could not be started.");
+      }
+    } catch (error) {
+      setAccountAuthLoading(false);
+      setAuthError("Google sign-in could not be started.");
+    }
+  };
+
+  const sendEmailOtp = async ({ resend = false } = {}) => {
+    setAuthError("");
+    setEmailOtpStatus("");
+
+    if (!supabaseConfigured || !supabase) {
+      setAuthError("Account sign-in is not configured yet. Add the public Supabase settings and restart the frontend.");
+      return;
+    }
+
+    if (resend && emailOtpCooldown > 0) {
+      setEmailOtpStatus(`You can request another code in ${emailOtpCooldown}s.`);
+      return;
+    }
+
+    const email = normalizeAuthEmail(accountEmail);
+    if (!isValidAuthEmail(email)) {
+      setAuthError("Enter a valid email address to continue.");
+      return;
+    }
+
+    setAccountAuthLoading(true);
+    window.localStorage.setItem(SKIP_GUEST_AUTO_START_KEY, "true");
+    let error = null;
+    try {
+      const response = await supabase.auth.signInWithOtp({
+        email,
+        options: {
+          emailRedirectTo: window.location.origin,
+          shouldCreateUser: true
+        }
+      });
+      error = response.error;
+    } catch (caughtError) {
+      error = caughtError;
+    } finally {
+      setAccountAuthLoading(false);
+    }
 
     if (error) {
-      setAccountAuthLoading(false);
-      setAuthError(error.message || "Google sign-in could not be started.");
+      setAuthError("Could not send a verification code. Please wait and try again.");
+      return;
     }
+
+    setAccountEmail(email);
+    setAccountOtp("");
+    setEmailOtpSent(true);
+    setEmailOtpCooldown(OTP_COOLDOWN_SECONDS);
+    setEmailOtpStatus(resend ? "A new verification code was sent." : "Verification code sent.");
   };
 
   const signInWithEmail = async (event) => {
     event.preventDefault();
+    await sendEmailOtp();
+  };
+
+  const resendEmailOtp = async () => {
+    await sendEmailOtp({ resend: true });
+  };
+
+  const verifyEmailOtp = async (event) => {
+    event.preventDefault();
     setAuthError("");
-    setEmailLinkSent(false);
+    setEmailOtpStatus("");
 
     if (!supabaseConfigured || !supabase) {
       setAuthError("Account sign-in is not configured yet. Add the public Supabase settings and restart the frontend.");
       return;
     }
 
-    const email = accountEmail.trim();
-    if (!email) {
-      setAuthError("Enter your email address to continue.");
+    const email = normalizeAuthEmail(accountEmail);
+    const code = sanitizeOtpCode(accountOtp);
+    if (!isValidAuthEmail(email)) {
+      setAuthError("Enter a valid email address to continue.");
+      return;
+    }
+    if (!isValidOtpCode(code)) {
+      setAuthError(`Enter the ${OTP_CODE_LENGTH}-digit verification code.`);
       return;
     }
 
     setAccountAuthLoading(true);
-    window.localStorage.setItem(SKIP_GUEST_AUTO_START_KEY, "true");
-    const { error } = await supabase.auth.signInWithOtp({
-      email,
-      options: {
-        emailRedirectTo: window.location.origin,
-        shouldCreateUser: true
+    try {
+      const { data, error } = await supabase.auth.verifyOtp({
+        email,
+        token: code,
+        type: "email"
+      });
+
+      if (error) {
+        throw error;
       }
-    });
-    setAccountAuthLoading(false);
 
-    if (error) {
-      setAuthError(error.message || "Email sign-in link could not be sent.");
-      return;
+      const authSession = data?.session || (await supabase.auth.getSession())?.data?.session;
+      if (!authSession?.access_token) {
+        throw new Error("Verification did not return an account session.");
+      }
+
+      const exchanged = await exchangeSupabaseAccountSession(authSession);
+      if (!exchanged) {
+        throw new Error("Account session could not be completed.");
+      }
+
+      setAccountOtp("");
+      setEmailOtpSent(false);
+      setEmailOtpStatus("");
+    } catch (error) {
+      setAuthError("Verification code could not be confirmed.");
+    } finally {
+      setAccountAuthLoading(false);
     }
-
-    setEmailLinkSent(true);
   };
 
   const completeOnboarding = async () => {
@@ -4215,19 +4416,55 @@ function App() {
                 <input
                   type="email"
                   autoComplete="email"
+                  maxLength={MAX_AUTH_EMAIL_CHARS}
                   value={accountEmail}
-                  onChange={(event) => setAccountEmail(event.target.value)}
+                  onChange={(event) => {
+                    setAccountEmail(event.target.value);
+                    setEmailOtpSent(false);
+                    setAccountOtp("");
+                    setEmailOtpStatus("");
+                  }}
                   placeholder="Email address"
                   aria-label="Email address"
                 />
               </label>
               <button type="submit" className="email-action" disabled={accountAuthLoading}>
                 <MailIcon />
-                <span>Continue with Email</span>
+                <span>{accountAuthLoading ? "Sending..." : "Continue with Email"}</span>
               </button>
             </form>
-            {emailLinkSent && (
-              <small className="email-sent">Check your email for your secure sign-in link.</small>
+            {emailOtpSent && (
+              <form className="otp-verify-form" onSubmit={verifyEmailOtp}>
+                <label className="otp-field">
+                  Verification code
+                  <input
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    value={accountOtp}
+                    onChange={(event) => setAccountOtp(sanitizeOtpCode(event.target.value))}
+                    placeholder="6-digit code"
+                    aria-label="Verification code"
+                  />
+                </label>
+                <button
+                  type="submit"
+                  className="email-action"
+                  disabled={accountAuthLoading || !isValidOtpCode(accountOtp)}
+                >
+                  <LockIcon />
+                  <span>{accountAuthLoading ? "Verifying..." : "Verify and Continue"}</span>
+                </button>
+                <div className="otp-resend-row">
+                  <small>{emailOtpStatus || "Enter the code from your email."}</small>
+                  <button
+                    type="button"
+                    onClick={resendEmailOtp}
+                    disabled={accountAuthLoading || emailOtpCooldown > 0}
+                  >
+                    {emailOtpCooldown > 0 ? `Resend in ${emailOtpCooldown}s` : "Resend OTP"}
+                  </button>
+                </div>
+              </form>
             )}
           </section>
           <p className="auth-privacy">
@@ -4306,7 +4543,7 @@ function App() {
               <input
                 type="password"
                 value={pin}
-                minLength={4}
+                minLength={PIN_MIN_LENGTH}
                 onChange={(event) => setPin(event.target.value)}
                 placeholder="Enter PIN"
               />
@@ -4342,7 +4579,7 @@ function App() {
               <input
                 type="password"
                 value={pin}
-                minLength={4}
+                minLength={PIN_MIN_LENGTH}
                 onChange={(event) => setPin(event.target.value)}
                 placeholder="At least 4 characters"
               />
@@ -4392,7 +4629,7 @@ function App() {
             {pinResetStep === "start" && (
               <div className="pin-reset-step">
                 <p className="dialog-muted">
-                  A short-lived verification code will be prepared for your signed-in email.
+                  We will send a verification code to your signed-in account email.
                 </p>
                 <div className="dialog-actions">
                   <button type="button" onClick={closePinResetModal} disabled={pinResetBusy}>
@@ -4404,7 +4641,7 @@ function App() {
                     onClick={startPinReset}
                     disabled={pinResetBusy || !selectedProfileId}
                   >
-                    {pinResetBusy ? "Preparing..." : "Send Code"}
+                    {pinResetBusy ? "Sending..." : "Send Code"}
                   </button>
                 </div>
               </div>
@@ -4413,21 +4650,27 @@ function App() {
             {pinResetStep === "verify" && (
               <form className="pin-reset-step" onSubmit={verifyPinReset}>
                 {pinResetInfo && <div className="dialog-info">{pinResetInfo}</div>}
-                {pinResetDevCode && (
-                  <div className="dialog-info dev-code">
-                    Local testing code: <strong>{pinResetDevCode}</strong>
-                  </div>
-                )}
                 <label className="dialog-field">
                   Verification code
                   <input
                     autoFocus
                     inputMode="numeric"
+                    autoComplete="one-time-code"
                     value={pinResetCode}
-                    onChange={(event) => setPinResetCode(event.target.value)}
-                    placeholder="Enter code"
+                    onChange={(event) => setPinResetCode(sanitizeOtpCode(event.target.value))}
+                    placeholder="6-digit code"
                   />
                 </label>
+                <div className="otp-resend-row dialog-otp-row">
+                  <small>Use the latest code from your account email.</small>
+                  <button
+                    type="button"
+                    onClick={resendPinResetOtp}
+                    disabled={pinResetBusy || pinResetCooldown > 0}
+                  >
+                    {pinResetCooldown > 0 ? `Resend in ${pinResetCooldown}s` : "Resend OTP"}
+                  </button>
+                </div>
                 <div className="dialog-actions">
                   <button type="button" onClick={closePinResetModal} disabled={pinResetBusy}>
                     Cancel
@@ -4435,7 +4678,7 @@ function App() {
                   <button
                     type="submit"
                     className="primary-dialog-action"
-                    disabled={pinResetBusy || !pinResetCode.trim()}
+                    disabled={pinResetBusy || !isValidOtpCode(pinResetCode)}
                   >
                     {pinResetBusy ? "Checking..." : "Verify Code"}
                   </button>
@@ -4451,7 +4694,7 @@ function App() {
                   <input
                     autoFocus
                     type="password"
-                    minLength={4}
+                    minLength={PIN_MIN_LENGTH}
                     value={pinResetNewPin}
                     onChange={(event) => setPinResetNewPin(event.target.value)}
                     placeholder="At least 4 characters"
@@ -4461,7 +4704,7 @@ function App() {
                   Confirm new PIN
                   <input
                     type="password"
-                    minLength={4}
+                    minLength={PIN_MIN_LENGTH}
                     value={pinResetConfirmPin}
                     onChange={(event) => setPinResetConfirmPin(event.target.value)}
                     placeholder="Re-enter new PIN"

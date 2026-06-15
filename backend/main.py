@@ -348,8 +348,6 @@ ACCOUNT_SHARED_VOICE_SETTINGS = {"voiceEnabled", "sentenceVoice"}
 DEVICE_PROFILE_LIMIT = 3
 DEVICE_PROFILE_NOT_FOUND = "Profile does not exist on this device."
 PIN_HASH_ITERATIONS = 200_000
-PIN_RESET_CODE_TTL_SECONDS = 10 * 60
-PIN_RESET_CODE_LENGTH = 6
 SESSION_MODES = {"guest", "account", "profile"}
 
 
@@ -910,7 +908,7 @@ class ProfilePinResetVerifyRequest(BaseModel):
 
 class ProfilePinResetCompleteRequest(BaseModel):
     profile_id: str = Field(min_length=1, max_length=MAX_CHAT_ID_CHARS)
-    code: str = Field(min_length=4, max_length=16)
+    account_access_token: str = Field(min_length=1, max_length=MAX_AUTH_TOKEN_CHARS)
     new_pin: str = Field(min_length=4, max_length=MAX_PIN_CHARS)
 
 
@@ -3502,80 +3500,6 @@ def verify_pin(profile: dict[str, Any], pin: str) -> bool:
     return secrets.compare_digest(expected, calculated)
 
 
-def generate_pin_reset_code() -> str:
-    upper_bound = 10 ** PIN_RESET_CODE_LENGTH
-    return f"{secrets.randbelow(upper_bound):0{PIN_RESET_CODE_LENGTH}d}"
-
-
-def hash_verification_code(code: str, salt: str) -> str:
-    normalized = re.sub(r"\s+", "", str(code or ""))
-    return hash_pin(normalized, salt)
-
-
-def should_expose_dev_pin_reset_code() -> bool:
-    env_name = (
-        os.getenv("FEBGUY_ENV")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENV")
-        or "development"
-    ).strip().lower()
-    return env_name not in {"prod", "production"}
-
-
-def require_email_service_configured() -> None:
-    if not RESEND_API_KEY or not EMAIL_FROM:
-        raise HTTPException(status_code=503, detail="Email service is not configured.")
-
-
-def send_resend_email(*, to_email: str, subject: str, text: str, html: str | None = None) -> None:
-    require_email_service_configured()
-    try:
-        response = requests.post(
-            RESEND_EMAIL_URL,
-            headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": EMAIL_FROM,
-                "to": [to_email],
-                "subject": subject,
-                "text": text,
-                **({"html": html} if html else {}),
-            },
-            timeout=10,
-        )
-    except requests.RequestException as exc:
-        LOGGER.warning("Resend email request failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Email could not be sent.") from exc
-
-    if not 200 <= response.status_code < 300:
-        LOGGER.warning("Resend email request failed with status %s", response.status_code)
-        raise HTTPException(status_code=502, detail="Email could not be sent.")
-
-
-def send_pin_reset_email(*, to_email: str, profile_name: str, code: str) -> None:
-    safe_profile_name = (profile_name or "your profile").strip() or "your profile"
-    text = (
-        f"Your FebGuyAI PIN reset code for {safe_profile_name} is {code}.\n\n"
-        f"This code expires in {PIN_RESET_CODE_TTL_SECONDS // 60} minutes. "
-        "If you did not request this, you can ignore this email."
-    )
-    html_body = (
-        "<p>Your FebGuyAI PIN reset code for "
-        f"<strong>{html.escape(safe_profile_name)}</strong> is:</p>"
-        f"<p style=\"font-size:24px;font-weight:700;letter-spacing:4px;\">{html.escape(code)}</p>"
-        f"<p>This code expires in {PIN_RESET_CODE_TTL_SECONDS // 60} minutes.</p>"
-        "<p>If you did not request this, you can ignore this email.</p>"
-    )
-    send_resend_email(
-        to_email=to_email,
-        subject="Your FebGuyAI PIN reset code",
-        text=text,
-        html=html_body,
-    )
-
-
 def find_profile(profile_id: str) -> dict[str, Any] | None:
     ensure_files()
     with db_connect() as conn:
@@ -3672,118 +3596,6 @@ def get_owned_device_profile(profile_id: str, user_id: str, device_id: str) -> d
     ):
         raise HTTPException(status_code=404, detail=DEVICE_PROFILE_NOT_FOUND)
     return profile
-
-
-def store_profile_pin_reset_code(
-    *,
-    user_id: str,
-    profile_id: str,
-    device_id: str,
-    code: str,
-) -> str:
-    salt = secrets.token_hex(16)
-    timestamp = now_iso()
-    expires_at = datetime.fromtimestamp(time.time() + PIN_RESET_CODE_TTL_SECONDS).isoformat(
-        timespec="seconds"
-    )
-    with DATA_LOCK:
-        with db_connect() as conn:
-            ensure_device_row(conn, device_id)
-            conn.execute(
-                """
-                UPDATE profile_pin_reset_codes
-                SET used_at = ?
-                WHERE user_id = ?
-                    AND profile_id = ?
-                    AND device_id = ?
-                    AND used_at IS NULL
-                """,
-                (timestamp, user_id, profile_id, device_id),
-            )
-            conn.execute(
-                """
-                INSERT INTO profile_pin_reset_codes
-                    (id, user_id, profile_id, device_id, code_salt, code_hash,
-                     expires_at, used_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    user_id,
-                    profile_id,
-                    device_id,
-                    salt,
-                    hash_verification_code(code, salt),
-                    expires_at,
-                    timestamp,
-                ),
-            )
-    return expires_at
-
-
-def invalidate_profile_pin_reset_codes(*, user_id: str, profile_id: str, device_id: str) -> None:
-    with DATA_LOCK:
-        with db_connect() as conn:
-            conn.execute(
-                """
-                UPDATE profile_pin_reset_codes
-                SET used_at = ?
-                WHERE user_id = ?
-                    AND profile_id = ?
-                    AND device_id = ?
-                    AND used_at IS NULL
-                """,
-                (now_iso(), user_id, profile_id, device_id),
-            )
-
-
-def verify_profile_pin_reset_code(
-    *,
-    user_id: str,
-    profile_id: str,
-    device_id: str,
-    code: str,
-    mark_used: bool = False,
-) -> None:
-    normalized_code = re.sub(r"\s+", "", str(code or ""))
-    if not normalized_code:
-        raise HTTPException(status_code=400, detail="Verification code is required.")
-
-    with DATA_LOCK:
-        with db_connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, code_salt, code_hash, expires_at, used_at
-                FROM profile_pin_reset_codes
-                WHERE user_id = ?
-                    AND profile_id = ?
-                    AND device_id = ?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (user_id, profile_id, device_id),
-            ).fetchone()
-
-            if not row or row["used_at"]:
-                raise HTTPException(status_code=400, detail="Verification code is invalid or expired.")
-
-            try:
-                expired = datetime.fromisoformat(row["expires_at"]) < datetime.now()
-            except ValueError:
-                expired = True
-            if expired:
-                raise HTTPException(status_code=400, detail="Verification code is invalid or expired.")
-
-            expected = row["code_hash"]
-            calculated = hash_verification_code(normalized_code, row["code_salt"])
-            if not secrets.compare_digest(expected, calculated):
-                raise HTTPException(status_code=401, detail="Verification code is incorrect.")
-
-            if mark_used:
-                conn.execute(
-                    "UPDATE profile_pin_reset_codes SET used_at = ? WHERE id = ?",
-                    (now_iso(), row["id"]),
-                )
 
 
 def is_guest_profile_id(profile_id: str | None) -> bool:
@@ -11725,43 +11537,17 @@ def start_profile_pin_reset(
     if not user:
         raise HTTPException(status_code=401, detail="Signed-in account no longer exists.")
 
-    require_email_service_configured()
-    code = generate_pin_reset_code()
-    expires_at = store_profile_pin_reset_code(
-        user_id=user_id,
-        profile_id=profile["id"],
-        device_id=device_id,
-        code=code,
-    )
-    try:
-        send_pin_reset_email(
-            to_email=user["email"],
-            profile_name=profile.get("name", "Profile"),
-            code=code,
-        )
-    except HTTPException:
-        invalidate_profile_pin_reset_codes(
-            user_id=user_id,
-            profile_id=profile["id"],
-            device_id=device_id,
-        )
-        raise
-
     log_activity(
         user["workspace_profile_id"],
         "profile_pin_reset_started",
         {"profile_id": profile["id"]},
     )
 
-    response: dict[str, Any] = {
+    return {
         "ok": True,
-        "email": user["email"],
-        "expires_at": expires_at,
-        "expires_in_seconds": PIN_RESET_CODE_TTL_SECONDS,
-        "message": f"Verification code sent to {user['email']}.",
-        "delivery": "resend",
+        "message": "Send and verify the account email OTP with Supabase Auth before resetting the PIN.",
+        "delivery": "supabase_auth",
     }
-    return response
 
 
 @app.post("/profiles/pin-reset/verify")
@@ -11777,14 +11563,11 @@ def verify_profile_pin_reset(
     if not user_id or not device_id:
         raise HTTPException(status_code=403, detail="Sign in on this device to reset a profile PIN.")
 
-    profile = get_owned_device_profile(data.profile_id, user_id, device_id)
-    verify_profile_pin_reset_code(
-        user_id=user_id,
-        profile_id=profile["id"],
-        device_id=device_id,
-        code=data.code,
+    get_owned_device_profile(data.profile_id, user_id, device_id)
+    raise HTTPException(
+        status_code=410,
+        detail="PIN reset verification now uses Supabase Auth OTP.",
     )
-    return {"ok": True, "message": "Verification code confirmed."}
 
 
 @app.post("/profiles/pin-reset/complete")
@@ -11808,19 +11591,19 @@ def complete_profile_pin_reset(
     user = find_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="Signed-in account no longer exists.")
+
+    identity = verify_supabase_access_token(data.account_access_token)
+    if (
+        identity.get("auth_user_id") != user.get("auth_user_id")
+        or identity.get("email") != user.get("email")
+    ):
+        raise HTTPException(status_code=403, detail="Account verification could not be confirmed.")
+
     account_token = create_account_session(user_id)
     account_profile = account_workspace_profile(user)
     if not account_profile:
         delete_session(account_token)
         raise HTTPException(status_code=500, detail="Account workspace could not be prepared.")
-
-    verify_profile_pin_reset_code(
-        user_id=user_id,
-        profile_id=profile["id"],
-        device_id=device_id,
-        code=data.code,
-        mark_used=True,
-    )
 
     salt = secrets.token_hex(16)
     with DATA_LOCK:
