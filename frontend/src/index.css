@@ -3030,6 +3030,14 @@ label {
   font-weight: 800;
 }
 
+.profile-avatar img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
+  border-radius: inherit;
+}
+
 .settings-identity div:last-child {
   min-width: 0;
   display: grid;

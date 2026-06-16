@@ -334,6 +334,23 @@ function initialsFor(value) {
   return initials || "FG";
 }
 
+function ProfileAvatar({ label, imageUrl }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  useEffect(() => {
+    setImageFailed(false);
+  }, [imageUrl]);
+  const showImage = imageUrl && !imageFailed;
+  return (
+    <div className="profile-avatar">
+      {showImage ? (
+        <img src={imageUrl} alt="" aria-hidden="true" onError={() => setImageFailed(true)} />
+      ) : (
+        initialsFor(label)
+      )}
+    </div>
+  );
+}
+
 function getSpeechRecognitionConstructor() {
   return window.SpeechRecognition || window.webkitSpeechRecognition || null;
 }
@@ -495,6 +512,7 @@ function App() {
   const [deviceId] = useState(loadDeviceId);
   const [profileToken, setProfileToken] = useState("");
   const [profile, setProfile] = useState(null);
+  const [profileAvatarUrl, setProfileAvatarUrl] = useState("");
   const [sessionMode, setSessionMode] = useState("");
   const [profiles, setProfiles] = useState([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
@@ -757,6 +775,45 @@ function App() {
       "X-FebGuy-Device-ID": deviceId
     };
   }, [deviceId, profileToken]);
+
+  useEffect(() => {
+    const sourceUrl = profile?.profile_image_url || profile?.imageUrl || "";
+    if (!profileToken || !profile?.has_profile_image || !sourceUrl) {
+      setProfileAvatarUrl("");
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    let active = true;
+    let objectUrl = "";
+    setProfileAvatarUrl("");
+
+    fetch(sourceUrl, {
+      headers: authHeaders(profileToken),
+      signal: controller.signal
+    })
+      .then(response => (response.ok ? response.blob() : null))
+      .then(blob => {
+        if (!active || !blob) {
+          return;
+        }
+        objectUrl = URL.createObjectURL(blob);
+        setProfileAvatarUrl(objectUrl);
+      })
+      .catch(() => {
+        if (active) {
+          setProfileAvatarUrl("");
+        }
+      });
+
+    return () => {
+      active = false;
+      controller.abort();
+      if (objectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+    };
+  }, [authHeaders, profile?.has_profile_image, profile?.id, profile?.imageUrl, profile?.profile_image_url, profileToken]);
 
   const setWorkspaceMessages = useCallback((targetWorkspace, updater) => {
     if (targetWorkspace === "code") {
@@ -4846,7 +4903,10 @@ function App() {
         ) : (
           <div className="panel-body settings-panel">
             <section className="settings-identity">
-              <div className="profile-avatar">{initialsFor(profile?.name || accountIdentity?.email || "Guest")}</div>
+              <ProfileAvatar
+                label={profile?.name || accountIdentity?.email || "Guest"}
+                imageUrl={profileAvatarUrl}
+              />
               <div>
                 <span>{sessionMode === "guest" ? "Guest workspace" : "Current profile"}</span>
                 <strong>{sessionMode === "guest" ? "Guest" : profile?.name}</strong>
@@ -5307,7 +5367,10 @@ function App() {
 
           <div className="header-controls">
             <div className="header-profile">
-              <div className="profile-avatar">{initialsFor(sessionMode === "guest" ? "Guest" : profile.name)}</div>
+              <ProfileAvatar
+                label={sessionMode === "guest" ? "Guest" : profile.name}
+                imageUrl={profileAvatarUrl}
+              />
               <div>
                 <strong>{sessionMode === "guest" ? "Guest workspace" : profile.name}</strong>
                 <small>{sessionMode === "guest" ? "Temporary session" : "Current profile"}</small>

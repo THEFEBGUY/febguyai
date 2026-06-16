@@ -88,6 +88,9 @@ create table if not exists public.profiles (
   profile_kind text not null default 'legacy',
   user_id uuid,
   device_id uuid,
+  profile_image_storage_path text,
+  profile_image_mime_type text,
+  profile_image_updated_at text,
   created_at text not null,
   last_login_at text
 );
@@ -324,9 +327,14 @@ create table if not exists public.files (
   file_name text not null,
   original_name text not null default '',
   file_type text,
+  mime_type text,
   path text not null unique,
+  storage_path text,
   document_id uuid,
-  created_at text not null
+  size_bytes bigint not null default 0,
+  metadata jsonb not null default '{}'::jsonb,
+  created_at text not null,
+  updated_at text
 );
 
 -- Add active columns when this runs over an older FebGuy/Supabase draft schema.
@@ -345,6 +353,9 @@ alter table public.profiles add column if not exists pin_hash text;
 alter table public.profiles add column if not exists profile_kind text not null default 'legacy';
 alter table public.profiles add column if not exists user_id uuid;
 alter table public.profiles add column if not exists device_id uuid;
+alter table public.profiles add column if not exists profile_image_storage_path text;
+alter table public.profiles add column if not exists profile_image_mime_type text;
+alter table public.profiles add column if not exists profile_image_updated_at text;
 alter table public.profiles add column if not exists created_at text;
 alter table public.profiles add column if not exists last_login_at text;
 alter table public.users add column if not exists id uuid;
@@ -526,9 +537,20 @@ alter table public.files add column if not exists device_id uuid;
 alter table public.files add column if not exists file_name text;
 alter table public.files add column if not exists original_name text not null default '';
 alter table public.files add column if not exists file_type text;
+alter table public.files add column if not exists mime_type text;
 alter table public.files add column if not exists path text;
+alter table public.files add column if not exists storage_path text;
 alter table public.files add column if not exists document_id uuid;
+alter table public.files add column if not exists size_bytes bigint not null default 0;
+alter table public.files add column if not exists metadata jsonb not null default '{}'::jsonb;
 alter table public.files add column if not exists created_at text;
+alter table public.files add column if not exists updated_at text;
+update public.files
+set storage_path = path
+where (storage_path is null or storage_path = '') and path is not null;
+update public.files
+set updated_at = created_at
+where updated_at is null and created_at is not null;
 
 -- Drop legacy boolean defaults before boolean-to-integer conversions.
 alter table public.users alter column onboarding_completed drop default;
@@ -1107,4 +1129,4 @@ comment on table public.users is 'Signed-in account records keyed by auth.users(
 comment on table public.profiles is 'FebGuy profile/workspace records keyed by UUID.';
 comment on table public.sessions is 'Workspace bearer sessions. Account sessions remain in account_sessions.';
 comment on table public.account_sessions is 'Account bearer sessions keyed to public.users/auth.users UUIDs.';
-comment on table public.files is 'Uploaded file metadata. File bytes remain on the configured backend storage path in Phase 1.';
+comment on table public.files is 'Uploaded and generated file metadata. New durable file bytes are stored in Supabase Storage; local paths are processing caches/backward compatibility.';
