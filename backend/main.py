@@ -25,7 +25,7 @@ from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from database_adapter import DatabaseService, DatabaseSettings
@@ -71,6 +71,8 @@ except Exception:
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
+APP_ENV = os.getenv("APP_ENV", os.getenv("FEBGUY_ENV", "development")).strip().lower()
+IS_PRODUCTION = APP_ENV in {"production", "prod"}
 DATA_DIR = Path(os.getenv("FEBGUY_DATA_DIR", BASE_DIR))
 PROCESSED_DIR = DATA_DIR / "processed_files"
 PROFILES_DIR = DATA_DIR / "profiles"
@@ -83,6 +85,7 @@ DATABASE_FILE = DATA_DIR / "febguy.db"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "profile-assets").strip() or "profile-assets"
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
 EMAIL_FROM = os.getenv("EMAIL_FROM", "").strip()
@@ -150,6 +153,7 @@ CONTEXT_LIMIT = int(os.getenv("FEBGUY_CONTEXT_LIMIT", "12000"))
 META_PREFIX = "\n\n[[FEBGUY_META:"
 META_SUFFIX = "]]"
 STREAM_RESPONSE_HEADERS = {
+    "Content-Type": "text/plain; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
     "X-Accel-Buffering": "no",
 }
@@ -160,6 +164,19 @@ GUEST_USAGE_LIMITS = {
     "code": 4,
     "upload": 3,
 }
+
+
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
 try:
     MAX_UPLOAD_MB = max(1, int(os.getenv("FEBGUY_MAX_UPLOAD_MB", "10") or "10"))
 except ValueError:
@@ -254,6 +271,7 @@ def select_chat_model(
 MAX_IMAGE_PIXELS = 40_000_000
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".txt"}
 DISALLOWED_UPLOAD_EXTENSIONS = {".exe", ".bat", ".cmd", ".sh", ".zip"}
+PROFILE_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 CODE_CONTEXT_EXTENSIONS = {
     ".py",
     ".js",
@@ -292,6 +310,18 @@ CANONICAL_UPLOAD_MIME_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".txt": "text/plain",
+}
+PROFILE_IMAGE_MIME_TYPES = {
+    ".png": {"image/png"},
+    ".jpg": {"image/jpeg", "image/jpg"},
+    ".jpeg": {"image/jpeg", "image/jpg"},
+    ".webp": {"image/webp"},
+}
+CANONICAL_PROFILE_IMAGE_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
 }
 GENERIC_UPLOAD_MIME_TYPES = {"", "application/octet-stream"}
 CODE_CONTEXT_MIME_TYPES = {
@@ -348,8 +378,6 @@ ACCOUNT_SHARED_VOICE_SETTINGS = {"voiceEnabled", "sentenceVoice"}
 DEVICE_PROFILE_LIMIT = 3
 DEVICE_PROFILE_NOT_FOUND = "Profile does not exist on this device."
 PIN_HASH_ITERATIONS = 200_000
-PIN_RESET_CODE_TTL_SECONDS = 10 * 60
-PIN_RESET_CODE_LENGTH = 6
 SESSION_MODES = {"guest", "account", "profile"}
 
 
@@ -362,6 +390,8 @@ def env_positive_int(name: str, default: int) -> int:
 
 MAX_REQUEST_MB = max(MAX_UPLOAD_MB + 1, env_positive_int("FEBGUY_MAX_REQUEST_MB", 20))
 MAX_REQUEST_BYTES = MAX_REQUEST_MB * 1024 * 1024
+MAX_PROFILE_IMAGE_MB = env_positive_int("FEBGUY_MAX_PROFILE_IMAGE_MB", 4)
+MAX_PROFILE_IMAGE_BYTES = MAX_PROFILE_IMAGE_MB * 1024 * 1024
 MAX_MESSAGE_CHARS = env_positive_int("FEBGUY_MAX_MESSAGE_CHARS", 24000)
 STREAM_CHAT_CONTEXT_MESSAGES = env_positive_int("FEBGUY_STREAM_CHAT_CONTEXT_MESSAGES", 14)
 STREAM_CODE_CONTEXT_MESSAGES = env_positive_int("FEBGUY_STREAM_CODE_CONTEXT_MESSAGES", 12)
@@ -377,6 +407,12 @@ MAX_CODE_CONTEXT_CHARS = env_positive_int("FEBGUY_MAX_CODE_CONTEXT_CHARS", 18000
 MAX_GENERATED_CODE_FILES = 4
 
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
+    "X-Frame-Options": "DENY",
+}
 RATE_LIMIT_RULES: dict[str, tuple[int, int]] = {
     "login": (env_positive_int("FEBGUY_RATE_LOGIN_REQUESTS", 10), 300),
     "profile_pin": (env_positive_int("FEBGUY_RATE_PIN_REQUESTS", 8), 300),
@@ -384,6 +420,7 @@ RATE_LIMIT_RULES: dict[str, tuple[int, int]] = {
     "guest_chat": (env_positive_int("FEBGUY_RATE_GUEST_CHAT_REQUESTS", 20), 60),
     "upload": (env_positive_int("FEBGUY_RATE_UPLOAD_REQUESTS", 15), 60),
     "ai": (env_positive_int("FEBGUY_RATE_AI_REQUESTS", 45), 60),
+    "admin": (env_positive_int("FEBGUY_RATE_ADMIN_REQUESTS", 5), 3600),
 }
 RATE_LIMIT_LABELS = {
     "login": "sign-in attempts",
@@ -392,6 +429,7 @@ RATE_LIMIT_LABELS = {
     "guest_chat": "guest messages",
     "upload": "file uploads",
     "ai": "AI requests",
+    "admin": "administrative requests",
 }
 # This process-local limiter protects a single backend instance. Use a shared
 # limiter when running multiple production workers.
@@ -619,7 +657,7 @@ def structured_error_response(
     request: Request | None = None,
     code: str | None = None,
     headers: dict[str, str] | None = None,
-) -> JSONResponse:
+) -> UTF8JSONResponse:
     message = public_error_message(detail)
     error: dict[str, str] = {
         "code": code or error_code_for_status(status_code),
@@ -632,7 +670,9 @@ def structured_error_response(
     response_headers = dict(headers or {})
     if request_id:
         response_headers["X-Request-ID"] = request_id
-    return JSONResponse(
+    for header, value in SECURITY_HEADERS.items():
+        response_headers.setdefault(header, value)
+    return UTF8JSONResponse(
         status_code=status_code,
         content={"ok": False, "error": error, "detail": message},
         headers=response_headers,
@@ -690,14 +730,32 @@ def validate_message_length(message: str) -> str:
     return value
 
 
-app = FastAPI(title="FebGuy AI Backend")
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
-    if origin.strip()
-]
-if "*" in ALLOWED_ORIGINS:
-    LOGGER.warning("CORS_ORIGINS contains '*'. Configure explicit production origins before deployment.")
+app = FastAPI(title="FebGuy AI Backend", default_response_class=UTF8JSONResponse)
+
+
+def parse_cors_origins(raw_origins: str) -> list[str]:
+    origins: list[str] = []
+    for raw_origin in raw_origins.split(","):
+        origin = raw_origin.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            if IS_PRODUCTION:
+                LOGGER.warning("Ignoring wildcard CORS origin in production.")
+                continue
+            return ["*"]
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            LOGGER.warning("Ignoring invalid CORS origin: %s", origin)
+            continue
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+ALLOWED_ORIGINS = parse_cors_origins(os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS))
+if IS_PRODUCTION and not ALLOWED_ORIGINS:
+    LOGGER.warning("No explicit CORS_ORIGINS configured for production.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -793,6 +851,9 @@ async def attach_device_context(request: Request, call_next):
         )
     try:
         response = await call_next(request)
+        for header, value in SECURITY_HEADERS.items():
+            if header not in response.headers:
+                response.headers[header] = value
         return response
     finally:
         total_ms = (time.perf_counter() - started_at) * 1000
@@ -910,7 +971,7 @@ class ProfilePinResetVerifyRequest(BaseModel):
 
 class ProfilePinResetCompleteRequest(BaseModel):
     profile_id: str = Field(min_length=1, max_length=MAX_CHAT_ID_CHARS)
-    code: str = Field(min_length=4, max_length=16)
+    account_access_token: str = Field(min_length=1, max_length=MAX_AUTH_TOKEN_CHARS)
     new_pin: str = Field(min_length=4, max_length=MAX_PIN_CHARS)
 
 
@@ -1001,6 +1062,24 @@ def encode_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
+def response_text_utf8(response: requests.Response, limit: int | None = None) -> str:
+    try:
+        text = response.content.decode("utf-8")
+    except UnicodeDecodeError:
+        text = ""
+    return text[:limit] if limit is not None else text
+
+
+def iter_utf8_response_lines(response: requests.Response) -> Iterable[str]:
+    for raw_line in response.iter_lines(decode_unicode=False):
+        if not raw_line:
+            continue
+        if isinstance(raw_line, bytes):
+            yield raw_line.decode("utf-8")
+        else:
+            yield str(raw_line)
+
+
 def decode_json(raw: str | None, default: Any) -> Any:
     if isinstance(raw, (dict, list)):
         return raw
@@ -1013,7 +1092,7 @@ def decode_json(raw: str | None, default: Any) -> Any:
 
 
 def clone_json_compatible(data: Any) -> Any:
-    return json.loads(json.dumps(data))
+    return json.loads(json.dumps(data, ensure_ascii=False))
 
 
 def elapsed_ms(started_at: float) -> float:
@@ -1193,7 +1272,7 @@ POSTGRES_CORE_TABLES = (
     "documents",
     "files",
 )
-POSTGRES_SCHEMA_VERSION = "session-flow-2026-06-07"
+POSTGRES_SCHEMA_VERSION = "storage-phase-2-2026-06-15"
 POSTGRES_RUNTIME_REPAIR_SQL = """
 create table if not exists public.meta (
   key text primary key,
@@ -1234,6 +1313,21 @@ where token_hash is null or token_hash = '';
 alter table public.devices alter column client_device_id set not null;
 alter table public.sessions alter column token_hash set default '';
 alter table public.sessions alter column token_hash set not null;
+alter table public.profiles add column if not exists profile_image_storage_path text;
+alter table public.profiles add column if not exists profile_image_mime_type text;
+alter table public.profiles add column if not exists profile_image_updated_at text;
+alter table public.files add column if not exists original_name text not null default '';
+alter table public.files add column if not exists mime_type text;
+alter table public.files add column if not exists storage_path text;
+alter table public.files add column if not exists size_bytes bigint;
+alter table public.files add column if not exists metadata jsonb not null default '{}'::jsonb;
+alter table public.files add column if not exists updated_at text;
+update public.files
+set storage_path = path
+where (storage_path is null or storage_path = '') and path is not null;
+update public.files
+set updated_at = created_at
+where updated_at is null and created_at is not null;
 create unique index if not exists idx_meta_key_unique
   on public.meta(key);
 create unique index if not exists idx_devices_id_unique
@@ -1372,6 +1466,9 @@ def init_database() -> None:
                     profile_kind TEXT NOT NULL DEFAULT 'legacy',
                     user_id TEXT,
                     device_id TEXT,
+                    profile_image_storage_path TEXT,
+                    profile_image_mime_type TEXT,
+                    profile_image_updated_at TEXT,
                     created_at TEXT NOT NULL,
                     last_login_at TEXT
                 );
@@ -1624,10 +1721,16 @@ def init_database() -> None:
                     guest_id TEXT,
                     device_id TEXT,
                     file_name TEXT NOT NULL,
+                    original_name TEXT NOT NULL DEFAULT '',
                     file_type TEXT,
+                    mime_type TEXT,
                     path TEXT NOT NULL UNIQUE,
+                    storage_path TEXT,
                     document_id TEXT,
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    metadata TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
+                    updated_at TEXT,
                     FOREIGN KEY(profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
                     FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE SET NULL
                 );
@@ -1681,6 +1784,14 @@ def init_database() -> None:
                 conn.execute("ALTER TABLE profiles ADD COLUMN user_id TEXT")
             if "device_id" not in profile_columns:
                 conn.execute("ALTER TABLE profiles ADD COLUMN device_id TEXT")
+            profile_column_defs = {
+                "profile_image_storage_path": "TEXT",
+                "profile_image_mime_type": "TEXT",
+                "profile_image_updated_at": "TEXT",
+            }
+            for column, definition in profile_column_defs.items():
+                if column not in profile_columns:
+                    conn.execute(f"ALTER TABLE profiles ADD COLUMN {column} {definition}")
             conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_profiles_account_device
@@ -1774,6 +1885,36 @@ def init_database() -> None:
                 for column in ("user_id", "guest_id", "device_id"):
                     if column not in columns:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+
+            file_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(files)").fetchall()
+            }
+            file_column_defs = {
+                "original_name": "TEXT NOT NULL DEFAULT ''",
+                "mime_type": "TEXT",
+                "storage_path": "TEXT",
+                "size_bytes": "INTEGER NOT NULL DEFAULT 0",
+                "metadata": "TEXT NOT NULL DEFAULT '{}'",
+                "updated_at": "TEXT",
+            }
+            for column, definition in file_column_defs.items():
+                if column not in file_columns:
+                    conn.execute(f"ALTER TABLE files ADD COLUMN {column} {definition}")
+            conn.execute(
+                """
+                UPDATE files
+                SET storage_path = path
+                WHERE (storage_path IS NULL OR storage_path = '') AND path IS NOT NULL
+                """
+            )
+            conn.execute(
+                """
+                UPDATE files
+                SET updated_at = created_at
+                WHERE updated_at IS NULL AND created_at IS NOT NULL
+                """
+            )
 
             settings_columns = {
                 row["name"]
@@ -2100,8 +2241,9 @@ def upsert_profile_row(conn: sqlite3.Connection, profile: dict[str, Any]) -> Non
         """
         INSERT INTO profiles
             (id, name, pin_salt, pin_hash, profile_kind, user_id, device_id,
-             created_at, last_login_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             profile_image_storage_path, profile_image_mime_type,
+             profile_image_updated_at, created_at, last_login_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             pin_salt = CASE
@@ -2115,6 +2257,9 @@ def upsert_profile_row(conn: sqlite3.Connection, profile: dict[str, Any]) -> Non
             profile_kind = excluded.profile_kind,
             user_id = excluded.user_id,
             device_id = excluded.device_id,
+            profile_image_storage_path = COALESCE(excluded.profile_image_storage_path, profiles.profile_image_storage_path),
+            profile_image_mime_type = COALESCE(excluded.profile_image_mime_type, profiles.profile_image_mime_type),
+            profile_image_updated_at = COALESCE(excluded.profile_image_updated_at, profiles.profile_image_updated_at),
             created_at = profiles.created_at,
             last_login_at = excluded.last_login_at
         """,
@@ -2126,6 +2271,9 @@ def upsert_profile_row(conn: sqlite3.Connection, profile: dict[str, Any]) -> Non
             profile.get("profile_kind", "legacy"),
             profile.get("user_id"),
             profile.get("device_id"),
+            profile.get("profile_image_storage_path"),
+            profile.get("profile_image_mime_type"),
+            profile.get("profile_image_updated_at"),
             profile.get("created_at") or now_iso(),
             profile.get("last_login_at") or profile.get("created_at") or now_iso(),
         ),
@@ -2141,6 +2289,9 @@ def row_to_profile(row: sqlite3.Row) -> dict[str, Any]:
         "profile_kind": row["profile_kind"] if "profile_kind" in row.keys() else "legacy",
         "user_id": row["user_id"] if "user_id" in row.keys() else None,
         "device_id": row["device_id"] if "device_id" in row.keys() else None,
+        "profile_image_storage_path": row["profile_image_storage_path"] if "profile_image_storage_path" in row.keys() else None,
+        "profile_image_mime_type": row["profile_image_mime_type"] if "profile_image_mime_type" in row.keys() else None,
+        "profile_image_updated_at": row["profile_image_updated_at"] if "profile_image_updated_at" in row.keys() else None,
         "created_at": row["created_at"],
         "last_login_at": row["last_login_at"],
     }
@@ -3077,6 +3228,8 @@ def upsert_file_row(
     *,
     document_id: str | None = None,
     scope: dict[str, str | None] | None = None,
+    storage_path: str | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     raw_path = str(path or "").strip()
     if not raw_path:
@@ -3104,6 +3257,13 @@ def upsert_file_row(
     file_id = existing["id"] if existing else str(uuid.uuid4())
     created_at = existing["created_at"] if existing else timestamp
     columns = table_column_names(conn, "files")
+    storage_location = str(storage_path or clean_path).strip() or clean_path
+    storage_metadata = dict(metadata or {})
+    if parse_supabase_storage_uri(storage_location):
+        storage_metadata.setdefault("storageProvider", "supabase")
+        storage_metadata.setdefault("storageBucket", SUPABASE_STORAGE_BUCKET)
+    else:
+        storage_metadata.setdefault("storageProvider", "local")
     values: dict[str, Any] = {
         "id": file_id,
         "profile_id": profile_id,
@@ -3115,10 +3275,10 @@ def upsert_file_row(
         "file_type": safe_type,
         "mime_type": safe_type,
         "path": clean_path,
-        "storage_path": clean_path,
+        "storage_path": storage_location,
         "document_id": document_id,
         "size_bytes": size_bytes,
-        "metadata": encode_json({}),
+        "metadata": encode_json(storage_metadata),
         "created_at": created_at,
         "updated_at": timestamp,
     }
@@ -3172,7 +3332,12 @@ def save_owned_file_record(
     file_name: str,
     file_type: str = "",
     document_id: str | None = None,
+    storage_path: str | None = None,
 ) -> None:
+    safe_type = file_type or CANONICAL_UPLOAD_MIME_TYPES.get(Path(file_name).suffix.lower(), "application/octet-stream")
+    storage_location = storage_path
+    if storage_location is None:
+        storage_location = upload_local_profile_asset(profile_id, path, safe_type, required=False)
     with DATA_LOCK:
         with db_connect() as conn:
             upsert_file_row(
@@ -3180,8 +3345,9 @@ def save_owned_file_record(
                 profile_id,
                 str(path),
                 file_name,
-                file_type,
+                safe_type,
                 document_id=document_id,
+                storage_path=storage_location,
             )
 
 
@@ -3299,6 +3465,11 @@ def save_document_record(
                 metadata.get("type", ""),
                 document_id=document_id,
                 scope=scope,
+                storage_path=metadata.get("storage_path"),
+                metadata={
+                    "storageProvider": metadata.get("storage_provider", "local"),
+                    "source": "document_upload",
+                },
             )
     return metadata
 
@@ -3315,6 +3486,16 @@ def load_document_record(profile_id: str, document_id: str | None) -> dict[str, 
             f"SELECT * FROM documents WHERE {owner_clause} AND id = ?",
             (*owner_params, document_id),
         ).fetchone()
+        file_row = conn.execute(
+            f"""
+            SELECT storage_path
+            FROM files
+            WHERE {owner_clause} AND document_id = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (*owner_params, document_id),
+        ).fetchone() if row else None
 
     if not row:
         return None
@@ -3330,6 +3511,7 @@ def load_document_record(profile_id: str, document_id: str | None) -> dict[str, 
         "is_image": bool(row["is_image"]),
         "used_ocr": bool(row["used_ocr"]),
         "page_count": row["page_count"],
+        "storage_path": file_row["storage_path"] if file_row and "storage_path" in file_row.keys() else "",
     }
 
 
@@ -3413,6 +3595,14 @@ def remove_profile_storage(profile_id: str) -> None:
             LOGGER.warning("Could not remove profile storage for %s: %s", profile_id, type(exc).__name__)
 
 
+def retrieve_profile_image_url(profile: dict[str, Any]) -> str:
+    if not profile.get("profile_image_storage_path") or not profile.get("id"):
+        return ""
+    updated_at = str(profile.get("profile_image_updated_at") or "")
+    version = f"?v={updated_at}" if updated_at else ""
+    return f"{API_PUBLIC_BASE_URL}/profiles/{profile['id']}/avatar{version}"
+
+
 def public_profile(profile: dict[str, Any]) -> dict[str, Any]:
     if profile.get("auth_mode") == "account":
         user = profile["account_user"]
@@ -3436,6 +3626,11 @@ def public_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "last_login_at": profile.get("last_login_at"),
         "mode": "guest" if profile.get("is_guest") else "profile",
     }
+    image_url = retrieve_profile_image_url(profile)
+    if image_url:
+        payload["profile_image_url"] = image_url
+        payload["imageUrl"] = image_url
+        payload["has_profile_image"] = True
 
     if profile.get("is_guest"):
         payload["guest_id"] = profile.get("guest_id")
@@ -3452,6 +3647,8 @@ def load_profiles_data() -> dict[str, Any]:
             """
             SELECT profiles.id, profiles.name, profiles.pin_salt, profiles.pin_hash,
                 profiles.profile_kind, profiles.user_id, profiles.device_id,
+                profiles.profile_image_storage_path, profiles.profile_image_mime_type,
+                profiles.profile_image_updated_at,
                 profiles.created_at, profiles.last_login_at
             FROM profiles
             LEFT JOIN guest_sessions ON guest_sessions.profile_id = profiles.id
@@ -3502,80 +3699,6 @@ def verify_pin(profile: dict[str, Any], pin: str) -> bool:
     return secrets.compare_digest(expected, calculated)
 
 
-def generate_pin_reset_code() -> str:
-    upper_bound = 10 ** PIN_RESET_CODE_LENGTH
-    return f"{secrets.randbelow(upper_bound):0{PIN_RESET_CODE_LENGTH}d}"
-
-
-def hash_verification_code(code: str, salt: str) -> str:
-    normalized = re.sub(r"\s+", "", str(code or ""))
-    return hash_pin(normalized, salt)
-
-
-def should_expose_dev_pin_reset_code() -> bool:
-    env_name = (
-        os.getenv("FEBGUY_ENV")
-        or os.getenv("APP_ENV")
-        or os.getenv("ENV")
-        or "development"
-    ).strip().lower()
-    return env_name not in {"prod", "production"}
-
-
-def require_email_service_configured() -> None:
-    if not RESEND_API_KEY or not EMAIL_FROM:
-        raise HTTPException(status_code=503, detail="Email service is not configured.")
-
-
-def send_resend_email(*, to_email: str, subject: str, text: str, html: str | None = None) -> None:
-    require_email_service_configured()
-    try:
-        response = requests.post(
-            RESEND_EMAIL_URL,
-            headers={
-                "Authorization": f"Bearer {RESEND_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "from": EMAIL_FROM,
-                "to": [to_email],
-                "subject": subject,
-                "text": text,
-                **({"html": html} if html else {}),
-            },
-            timeout=10,
-        )
-    except requests.RequestException as exc:
-        LOGGER.warning("Resend email request failed: %s", type(exc).__name__)
-        raise HTTPException(status_code=502, detail="Email could not be sent.") from exc
-
-    if not 200 <= response.status_code < 300:
-        LOGGER.warning("Resend email request failed with status %s", response.status_code)
-        raise HTTPException(status_code=502, detail="Email could not be sent.")
-
-
-def send_pin_reset_email(*, to_email: str, profile_name: str, code: str) -> None:
-    safe_profile_name = (profile_name or "your profile").strip() or "your profile"
-    text = (
-        f"Your FebGuyAI PIN reset code for {safe_profile_name} is {code}.\n\n"
-        f"This code expires in {PIN_RESET_CODE_TTL_SECONDS // 60} minutes. "
-        "If you did not request this, you can ignore this email."
-    )
-    html_body = (
-        "<p>Your FebGuyAI PIN reset code for "
-        f"<strong>{html.escape(safe_profile_name)}</strong> is:</p>"
-        f"<p style=\"font-size:24px;font-weight:700;letter-spacing:4px;\">{html.escape(code)}</p>"
-        f"<p>This code expires in {PIN_RESET_CODE_TTL_SECONDS // 60} minutes.</p>"
-        "<p>If you did not request this, you can ignore this email.</p>"
-    )
-    send_resend_email(
-        to_email=to_email,
-        subject="Your FebGuyAI PIN reset code",
-        text=text,
-        html=html_body,
-    )
-
-
 def find_profile(profile_id: str) -> dict[str, Any] | None:
     ensure_files()
     with db_connect() as conn:
@@ -3583,6 +3706,8 @@ def find_profile(profile_id: str) -> dict[str, Any] | None:
             """
             SELECT profiles.id, profiles.name, profiles.pin_salt, profiles.pin_hash,
                 profiles.profile_kind, profiles.user_id, profiles.device_id,
+                profiles.profile_image_storage_path, profiles.profile_image_mime_type,
+                profiles.profile_image_updated_at,
                 profiles.created_at, profiles.last_login_at, guest_sessions.guest_id
             FROM profiles
             LEFT JOIN guest_sessions ON guest_sessions.profile_id = profiles.id
@@ -3620,6 +3745,8 @@ def find_legacy_profile_by_name(name: str | None) -> dict[str, Any] | None:
             """
             SELECT profiles.id, profiles.name, profiles.pin_salt, profiles.pin_hash,
                 profiles.profile_kind, profiles.user_id, profiles.device_id,
+                profiles.profile_image_storage_path, profiles.profile_image_mime_type,
+                profiles.profile_image_updated_at,
                 profiles.created_at, profiles.last_login_at, NULL AS guest_id
             FROM profiles
             LEFT JOIN guest_sessions ON guest_sessions.profile_id = profiles.id
@@ -3650,6 +3777,8 @@ def load_device_bound_profiles(user_id: str, device_id: str) -> list[dict[str, A
         rows = conn.execute(
             """
             SELECT id, name, pin_salt, pin_hash, profile_kind, user_id, device_id,
+                profile_image_storage_path, profile_image_mime_type,
+                profile_image_updated_at,
                 created_at, last_login_at, NULL AS guest_id
             FROM profiles
             WHERE profile_kind = 'account'
@@ -3674,118 +3803,6 @@ def get_owned_device_profile(profile_id: str, user_id: str, device_id: str) -> d
     return profile
 
 
-def store_profile_pin_reset_code(
-    *,
-    user_id: str,
-    profile_id: str,
-    device_id: str,
-    code: str,
-) -> str:
-    salt = secrets.token_hex(16)
-    timestamp = now_iso()
-    expires_at = datetime.fromtimestamp(time.time() + PIN_RESET_CODE_TTL_SECONDS).isoformat(
-        timespec="seconds"
-    )
-    with DATA_LOCK:
-        with db_connect() as conn:
-            ensure_device_row(conn, device_id)
-            conn.execute(
-                """
-                UPDATE profile_pin_reset_codes
-                SET used_at = ?
-                WHERE user_id = ?
-                    AND profile_id = ?
-                    AND device_id = ?
-                    AND used_at IS NULL
-                """,
-                (timestamp, user_id, profile_id, device_id),
-            )
-            conn.execute(
-                """
-                INSERT INTO profile_pin_reset_codes
-                    (id, user_id, profile_id, device_id, code_salt, code_hash,
-                     expires_at, used_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
-                """,
-                (
-                    str(uuid.uuid4()),
-                    user_id,
-                    profile_id,
-                    device_id,
-                    salt,
-                    hash_verification_code(code, salt),
-                    expires_at,
-                    timestamp,
-                ),
-            )
-    return expires_at
-
-
-def invalidate_profile_pin_reset_codes(*, user_id: str, profile_id: str, device_id: str) -> None:
-    with DATA_LOCK:
-        with db_connect() as conn:
-            conn.execute(
-                """
-                UPDATE profile_pin_reset_codes
-                SET used_at = ?
-                WHERE user_id = ?
-                    AND profile_id = ?
-                    AND device_id = ?
-                    AND used_at IS NULL
-                """,
-                (now_iso(), user_id, profile_id, device_id),
-            )
-
-
-def verify_profile_pin_reset_code(
-    *,
-    user_id: str,
-    profile_id: str,
-    device_id: str,
-    code: str,
-    mark_used: bool = False,
-) -> None:
-    normalized_code = re.sub(r"\s+", "", str(code or ""))
-    if not normalized_code:
-        raise HTTPException(status_code=400, detail="Verification code is required.")
-
-    with DATA_LOCK:
-        with db_connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, code_salt, code_hash, expires_at, used_at
-                FROM profile_pin_reset_codes
-                WHERE user_id = ?
-                    AND profile_id = ?
-                    AND device_id = ?
-                ORDER BY created_at DESC
-                LIMIT 1
-                """,
-                (user_id, profile_id, device_id),
-            ).fetchone()
-
-            if not row or row["used_at"]:
-                raise HTTPException(status_code=400, detail="Verification code is invalid or expired.")
-
-            try:
-                expired = datetime.fromisoformat(row["expires_at"]) < datetime.now()
-            except ValueError:
-                expired = True
-            if expired:
-                raise HTTPException(status_code=400, detail="Verification code is invalid or expired.")
-
-            expected = row["code_hash"]
-            calculated = hash_verification_code(normalized_code, row["code_salt"])
-            if not secrets.compare_digest(expected, calculated):
-                raise HTTPException(status_code=401, detail="Verification code is incorrect.")
-
-            if mark_used:
-                conn.execute(
-                    "UPDATE profile_pin_reset_codes SET used_at = ? WHERE id = ?",
-                    (now_iso(), row["id"]),
-                )
-
-
 def is_guest_profile_id(profile_id: str | None) -> bool:
     if not profile_id:
         return False
@@ -3804,6 +3821,73 @@ def save_profile(profile: dict[str, Any]) -> None:
     with DATA_LOCK:
         with db_connect() as conn:
             upsert_profile_row(conn, profile)
+
+
+def clear_cached_profile_sessions(profile_id: str) -> None:
+    with SESSION_ACCESS_LOCK:
+        for token, cached in list(SESSION_ACCESS_CACHE.items()):
+            cached_profile = cached.get("profile")
+            if isinstance(cached_profile, dict) and cached_profile.get("id") == profile_id:
+                SESSION_ACCESS_CACHE.pop(token, None)
+
+
+def update_profile_image_metadata(
+    profile_id: str,
+    storage_path: str | None,
+    mime_type: str | None,
+) -> dict[str, Any]:
+    timestamp = now_iso() if storage_path else None
+    with DATA_LOCK:
+        with db_connect() as conn:
+            updated = conn.execute(
+                """
+                UPDATE profiles
+                SET profile_image_storage_path = ?,
+                    profile_image_mime_type = ?,
+                    profile_image_updated_at = ?
+                WHERE id = ?
+                """,
+                (storage_path, mime_type, timestamp, profile_id),
+            ).rowcount
+    if not updated:
+        raise HTTPException(status_code=404, detail="Profile not found.")
+    clear_cached_profile_sessions(profile_id)
+    profile = find_profile(profile_id)
+    if not profile:
+        raise HTTPException(status_code=404, detail="Profile not found.")
+    return profile
+
+
+def require_profile_avatar_access(
+    profile_id: str,
+    current_profile: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    try:
+        safe_profile_id = str(uuid.UUID(str(profile_id)))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Profile image not found.")
+
+    target_profile = find_profile(safe_profile_id)
+    if not target_profile:
+        raise HTTPException(status_code=404, detail="Profile image not found.")
+
+    owner_id = account_owner_id(current_profile)
+    if current_profile.get("auth_mode") == "account":
+        device_id = getattr(request.state, "device_id", None)
+        if (
+            not owner_id
+            or not device_id
+            or target_profile.get("profile_kind") != "account"
+            or target_profile.get("user_id") != owner_id
+            or target_profile.get("device_id") != device_id
+        ):
+            raise HTTPException(status_code=404, detail="Profile image not found.")
+        return target_profile
+
+    if current_profile.get("id") != safe_profile_id:
+        raise HTTPException(status_code=404, detail="Profile image not found.")
+    return target_profile
 
 
 def ensure_profile_defaults(
@@ -4165,6 +4249,8 @@ def create_or_load_guest_session(device_id: str | None) -> dict[str, Any]:
                         """
                         SELECT profiles.id, profiles.name, profiles.pin_salt, profiles.pin_hash,
                             profiles.profile_kind, profiles.user_id, profiles.device_id,
+                            profiles.profile_image_storage_path, profiles.profile_image_mime_type,
+                            profiles.profile_image_updated_at,
                             profiles.created_at, profiles.last_login_at, guest_sessions.guest_id
                         FROM profiles
                         JOIN guest_sessions ON guest_sessions.profile_id = profiles.id
@@ -4897,7 +4983,7 @@ def cached_guest_usage_status(guest_id: str, device_id: str) -> dict[str, Any] |
         if time.monotonic() - float(cached.get("checked_at") or 0.0) > GUEST_USAGE_STATUS_CACHE_SECONDS:
             GUEST_USAGE_STATUS_CACHE.pop(key, None)
             return None
-        return json.loads(json.dumps(cached["status"]))
+        return json.loads(json.dumps(cached["status"], ensure_ascii=False))
 
 
 def cache_guest_usage_status(guest_id: str, device_id: str, status: dict[str, Any]) -> None:
@@ -4905,7 +4991,7 @@ def cache_guest_usage_status(guest_id: str, device_id: str, status: dict[str, An
     with GUEST_USAGE_STATUS_LOCK:
         GUEST_USAGE_STATUS_CACHE[key] = {
             "checked_at": time.monotonic(),
-            "status": json.loads(json.dumps(status)),
+            "status": json.loads(json.dumps(status, ensure_ascii=False)),
         }
 
 
@@ -4978,6 +5064,9 @@ def get_session_context(authorization: str | None) -> dict[str, Any]:
                     profiles.profile_kind AS profile_kind,
                     profiles.user_id AS user_id,
                     profiles.device_id AS device_id,
+                    profiles.profile_image_storage_path AS profile_image_storage_path,
+                    profiles.profile_image_mime_type AS profile_image_mime_type,
+                    profiles.profile_image_updated_at AS profile_image_updated_at,
                     profiles.created_at AS created_at,
                     profiles.last_login_at AS last_login_at,
                     guest_sessions.guest_id AS guest_id
@@ -5267,8 +5356,77 @@ def sort_chats(chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return pinned + unpinned
 
 
+PRIVATE_UPLOAD_METADATA_KEYS = {
+    "path",
+    "storage_path",
+    "storage_provider",
+    "storageProvider",
+    "storageBucket",
+    "context",
+    "content",
+    "raw_text",
+    "rawText",
+    "chunks",
+}
+
+
+def strip_private_file_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: strip_private_file_metadata(item)
+            for key, item in value.items()
+            if key not in PRIVATE_UPLOAD_METADATA_KEYS and not str(key).startswith("_")
+        }
+    if isinstance(value, list):
+        return [strip_private_file_metadata(item) for item in value]
+    return value
+
+
+def public_uploaded_file_payload(uploaded_file: Any) -> dict[str, Any] | None:
+    if not isinstance(uploaded_file, dict):
+        return None
+
+    payload: dict[str, Any] = {}
+    for key in ("name", "type", "document_id", "page_count", "is_image", "used_ocr"):
+        value = uploaded_file.get(key)
+        if value is not None and value != "":
+            payload[key] = value
+
+    chunks = uploaded_file.get("chunks")
+    if isinstance(chunks, list):
+        payload["chunk_count"] = len(chunks)
+
+    return payload or None
+
+
 def public_chat_payload(chat_item: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in chat_item.items() if not str(key).startswith("_")}
+    payload: dict[str, Any] = {}
+    for key, value in chat_item.items():
+        if str(key).startswith("_"):
+            continue
+        if key == "last_uploaded_file":
+            payload[key] = public_uploaded_file_payload(value)
+        elif key == "messages" and isinstance(value, list):
+            payload[key] = [strip_private_file_metadata(message) for message in value]
+        else:
+            payload[key] = strip_private_file_metadata(value)
+    return payload
+
+
+def public_chat_list(chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [public_chat_payload(chat_item) for chat_item in chats]
+
+
+def public_code_chat_payload(chat_item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: strip_private_file_metadata(value)
+        for key, value in chat_item.items()
+        if not str(key).startswith("_")
+    }
+
+
+def public_code_chat_list(chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [public_code_chat_payload(chat_item) for chat_item in chats]
 
 
 def load_chats(profile_id: str) -> list[dict[str, Any]]:
@@ -5476,7 +5634,7 @@ def save_current_chat(
                 ]
             else:
                 upsert_chat_row(conn, profile_id, current_chat, scope)
-    return load_chat_metadata(profile_id) if reload_metadata else []
+    return public_chat_list(load_chat_metadata(profile_id)) if reload_metadata else []
 
 
 def load_code_chats(profile_id: str) -> list[dict[str, Any]]:
@@ -5714,7 +5872,7 @@ def save_current_code_chat(
                 current_chat["projectFiles"] = current_chat.get("projectFiles", [])
             else:
                 upsert_code_chat_row(conn, profile_id, current_chat, scope)
-    return load_code_chat_metadata(profile_id) if reload_metadata else []
+    return public_code_chat_list(load_code_chat_metadata(profile_id)) if reload_metadata else []
 
 
 def safe_code_file_name(raw_name: str | None, fallback: str = "code.txt") -> str:
@@ -5892,7 +6050,7 @@ async def validate_code_context_upload(file: UploadFile) -> tuple[str, str, str]
     if file_type not in CODE_CONTEXT_MIME_TYPES and not file_type.startswith("text/"):
         raise HTTPException(status_code=415, detail=f"{file_name} is not a supported text/code file.")
 
-    content_bytes = await file.read()
+    content_bytes = await file.read(MAX_CODE_CONTEXT_FILE_BYTES + 1)
     if not content_bytes:
         raise HTTPException(status_code=400, detail=f"{file_name} is empty.")
     if len(content_bytes) > MAX_CODE_CONTEXT_FILE_BYTES:
@@ -6120,13 +6278,23 @@ def save_generated_code_files(
                 used_names.add(safe_name.lower())
                 file_path = ensure_controlled_file_path(output_folder / safe_name)
                 file_path.write_text(block["content"], encoding="utf-8")
+                file_type = CANONICAL_UPLOAD_MIME_TYPES.get(suffix, "text/plain; charset=utf-8")
+                storage_path = upload_local_profile_asset(
+                    profile_id,
+                    file_path,
+                    file_type,
+                    category="generated",
+                    required=False,
+                )
                 upsert_file_row(
                     conn,
                     profile_id,
                     str(file_path),
                     safe_name,
-                    file_type=CANONICAL_UPLOAD_MIME_TYPES.get(suffix, "text/plain; charset=utf-8"),
+                    file_type=file_type,
                     scope=scope,
+                    storage_path=storage_path,
+                    metadata={"source": "generated_code"},
                 )
                 saved_files.append(
                     {
@@ -6980,6 +7148,211 @@ def controlled_upload_directory(profile_id: str) -> Path:
     return upload_dir
 
 
+def supabase_storage_configured() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and SUPABASE_STORAGE_BUCKET)
+
+
+def supabase_storage_endpoint() -> str:
+    return f"{SUPABASE_URL.rstrip('/')}/storage/v1"
+
+
+def supabase_storage_headers(content_type: str | None = None) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+    }
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def validate_storage_object_path(object_path: str) -> str:
+    clean_path = str(object_path or "").strip().lstrip("/")
+    parts = [part for part in clean_path.split("/") if part]
+    if (
+        not parts
+        or len(clean_path) > 700
+        or any(part in {".", ".."} for part in parts)
+        or any("\x00" in part or "\\" in part for part in parts)
+    ):
+        raise HTTPException(status_code=400, detail="Unsafe storage path rejected.")
+    return "/".join(parts)
+
+
+def profile_storage_object_path(profile_id: str, category: str, *segments: str) -> str:
+    try:
+        safe_profile_id = str(uuid.UUID(str(profile_id)))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid profile storage owner.")
+    safe_category = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(category or "assets")).strip("-") or "assets"
+    clean_segments = []
+    for segment in segments:
+        part = Path(str(segment or "")).name
+        if not part or part in {".", ".."} or "\x00" in part or "/" in part or "\\" in part:
+            raise HTTPException(status_code=400, detail="Unsafe storage path rejected.")
+        clean_segments.append(part)
+    return validate_storage_object_path(
+        "/".join(["profiles", safe_profile_id, safe_category, *clean_segments])
+    )
+
+
+def supabase_storage_uri(object_path: str, bucket: str = SUPABASE_STORAGE_BUCKET) -> str:
+    return f"supabase://{bucket}/{validate_storage_object_path(object_path)}"
+
+
+def parse_supabase_storage_uri(storage_path: str | None) -> tuple[str, str] | None:
+    raw_path = str(storage_path or "").strip()
+    if not raw_path.startswith("supabase://"):
+        return None
+    remainder = raw_path[len("supabase://"):]
+    bucket, separator, object_path = remainder.partition("/")
+    if not separator or bucket != SUPABASE_STORAGE_BUCKET:
+        return None
+    return bucket, validate_storage_object_path(object_path)
+
+
+def storage_object_url(bucket: str, object_path: str) -> str:
+    encoded_path = "/".join(quote(part, safe="") for part in object_path.split("/"))
+    return f"{supabase_storage_endpoint()}/object/{quote(bucket, safe='')}/{encoded_path}"
+
+
+def storage_upload_failure_detail(response: requests.Response, content_type: str) -> str:
+    message = ""
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            message = str(
+                payload.get("message")
+                or payload.get("error")
+                or payload.get("detail")
+                or ""
+            )
+    except ValueError:
+        message = response_text_utf8(response, 240)
+    lowered = message.lower()
+    if "mime" in lowered or "content type" in lowered or "not allowed" in lowered:
+        return (
+            f"Supabase Storage rejected {content_type or 'this file type'}. "
+            f"Allow this MIME type on the {SUPABASE_STORAGE_BUCKET} bucket and retry."
+        )
+    return "Cloud storage upload failed. Please retry the upload."
+
+
+def upload_profile_asset_bytes(
+    object_path: str,
+    file_bytes: bytes,
+    content_type: str,
+    *,
+    required: bool = True,
+) -> str | None:
+    if not supabase_storage_configured():
+        return None
+    safe_path = validate_storage_object_path(object_path)
+    try:
+        response = requests.post(
+            storage_object_url(SUPABASE_STORAGE_BUCKET, safe_path),
+            headers={**supabase_storage_headers(content_type), "x-upsert": "true"},
+            data=file_bytes,
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            detail = storage_upload_failure_detail(response, content_type)
+            LOGGER.warning(
+                "Supabase Storage upload failed with status %s content_type=%s detail=%s",
+                response.status_code,
+                content_type,
+                detail,
+            )
+            if not required:
+                return None
+            raise HTTPException(status_code=502, detail=detail)
+        return supabase_storage_uri(safe_path)
+    except HTTPException:
+        raise
+    except requests.RequestException as exc:
+        LOGGER.warning("Supabase Storage upload request failed: %s", type(exc).__name__)
+        if not required:
+            return None
+        raise HTTPException(
+            status_code=502,
+            detail="Cloud storage is unavailable. Please retry the upload.",
+        )
+
+
+def upload_local_profile_asset(
+    profile_id: str,
+    file_path: Path,
+    content_type: str,
+    *,
+    category: str = "processed",
+    required: bool = True,
+) -> str | None:
+    if not supabase_storage_configured():
+        return None
+    safe_file_path = ensure_controlled_file_path(file_path)
+    relative_parts = safe_file_path.relative_to(PROCESSED_DIR.resolve()).parts
+    object_path = profile_storage_object_path(profile_id, category, *relative_parts)
+    return upload_profile_asset_bytes(
+        object_path,
+        safe_file_path.read_bytes(),
+        content_type,
+        required=required,
+    )
+
+
+def download_profile_asset_bytes(storage_path: str | None) -> bytes | None:
+    parsed = parse_supabase_storage_uri(storage_path)
+    if not parsed or not supabase_storage_configured():
+        return None
+    bucket, object_path = parsed
+    try:
+        response = requests.get(
+            storage_object_url(bucket, object_path),
+            headers=supabase_storage_headers(),
+            timeout=30,
+        )
+        if response.status_code == 404:
+            return None
+        if response.status_code >= 400:
+            LOGGER.warning("Supabase Storage download failed with status %s", response.status_code)
+            return None
+        return response.content
+    except requests.RequestException:
+        return None
+
+
+def restore_local_cache_from_storage(local_path: Path, storage_path: str | None) -> Path:
+    safe_local_path = ensure_controlled_file_path(local_path)
+    if safe_local_path.exists():
+        return safe_local_path
+    storage_bytes = download_profile_asset_bytes(storage_path)
+    if storage_bytes is None:
+        return safe_local_path
+    safe_local_path.parent.mkdir(parents=True, exist_ok=True)
+    safe_local_path.write_bytes(storage_bytes)
+    return safe_local_path
+
+
+def delete_profile_asset(storage_path: str | None) -> bool:
+    parsed = parse_supabase_storage_uri(storage_path)
+    if not parsed or not supabase_storage_configured():
+        return False
+    bucket, object_path = parsed
+    try:
+        response = requests.delete(
+            f"{supabase_storage_endpoint()}/object/{quote(bucket, safe='')}",
+            headers=supabase_storage_headers("application/json"),
+            json={"prefixes": [object_path]},
+            timeout=30,
+        )
+        if response.status_code >= 400:
+            LOGGER.warning("Supabase Storage delete failed with status %s", response.status_code)
+            return False
+        return True
+    except requests.RequestException:
+        return False
+
+
 def safe_file_name(raw_name: str | None) -> tuple[str, str]:
     original_name = str(raw_name or "").strip()
     if (
@@ -7093,6 +7466,42 @@ async def validate_uploaded_file(file: UploadFile) -> tuple[str, str, bytes]:
     return original_name, canonical_type, file_bytes
 
 
+async def validate_profile_image_upload(file: UploadFile) -> tuple[str, str, bytes]:
+    raw_name = str(file.filename or "profile.png").strip()
+    original_name = Path(raw_name).name
+    extension = Path(original_name).suffix.lower()
+    if (
+        not original_name
+        or original_name != raw_name
+        or extension not in PROFILE_IMAGE_EXTENSIONS
+        or "\x00" in original_name
+    ):
+        raise HTTPException(status_code=415, detail="Upload a PNG, JPG, JPEG, or WEBP profile image.")
+    submitted_type = str(file.content_type or "").split(";", 1)[0].strip().lower()
+    expected_types = PROFILE_IMAGE_MIME_TYPES[extension]
+    if submitted_type not in expected_types and submitted_type not in GENERIC_UPLOAD_MIME_TYPES:
+        raise HTTPException(status_code=415, detail="The profile image type does not match the file.")
+    file_bytes = await file.read(MAX_PROFILE_IMAGE_BYTES + 1)
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="The profile image is empty.")
+    if len(file_bytes) > MAX_PROFILE_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Profile image is too large. Maximum size is {MAX_PROFILE_IMAGE_MB} MB.",
+        )
+    try:
+        image = Image.open(io.BytesIO(file_bytes))
+        width, height = image.size
+        if width * height > MAX_IMAGE_PIXELS:
+            raise HTTPException(status_code=413, detail="Profile image dimensions are too large.")
+        image.verify()
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=415, detail="Upload a valid profile image.")
+    return extension, CANONICAL_PROFILE_IMAGE_MIME_TYPES[extension], file_bytes
+
+
 def extract_file_context(
     file_path: Path,
     file_name: str,
@@ -7185,7 +7594,18 @@ async def save_uploaded_file(
     upload_path = ensure_controlled_file_path(profile_upload_dir / unique_name)
     upload_path.write_bytes(file_bytes)
 
+    # Phase 2 storage audit: keep this local path as a processing cache while
+    # Supabase Storage becomes the durable source for new upload bytes.
+    storage_path = upload_profile_asset_bytes(
+        profile_storage_object_path(profile_id, "uploads", unique_name),
+        file_bytes,
+        canonical_type,
+        required=False,
+    )
     metadata = extract_file_context(upload_path, original_name, canonical_type)
+    if storage_path:
+        metadata["storage_path"] = storage_path
+        metadata["storage_provider"] = "supabase"
     return save_document_record(profile_id, chat_id, metadata)
 
 
@@ -7352,6 +7772,7 @@ def document_record_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "ocr_uncertain": used_ocr and len(raw_text.strip()) < 120,
         "text_unavailable": not bool(raw_text.strip()),
         "page_count": row["page_count"],
+        "storage_path": row["storage_path"] if "storage_path" in row.keys() else "",
     }
 
 
@@ -7367,7 +7788,13 @@ def load_relevant_documents(
         owner_clause, owner_params = owner_where(scope)
         rows = conn.execute(
             f"""
-            SELECT *
+            SELECT documents.*,
+                (
+                    SELECT files.storage_path
+                    FROM files
+                    WHERE files.document_id = documents.id
+                    LIMIT 1
+                ) AS storage_path
             FROM documents
             WHERE {owner_clause} AND chat_id = ?
             ORDER BY created_at DESC
@@ -7380,7 +7807,13 @@ def load_relevant_documents(
 
         rows = conn.execute(
             f"""
-            SELECT *
+            SELECT documents.*,
+                (
+                    SELECT files.storage_path
+                    FROM files
+                    WHERE files.document_id = documents.id
+                    LIMIT 1
+                ) AS storage_path
             FROM documents
             WHERE {owner_clause}
             ORDER BY created_at DESC
@@ -7540,6 +7973,8 @@ def build_file_context_from_chat(
         if not document.get("is_image") or document.get("document_id") not in selected_document_ids:
             continue
         file_path = Path(document.get("path", ""))
+        if document.get("storage_path"):
+            file_path = restore_local_cache_from_storage(file_path, document.get("storage_path"))
         if file_path.exists() and len(images) < 4:
             encoded = encode_image_base64(file_path)
             if not encoded:
@@ -10474,7 +10909,7 @@ def friendly_api_error(provider: str, exc: Exception | None = None, response: re
             else:
                 message = str(error_payload)
         except Exception:
-            message = response.text[:300]
+            message = response_text_utf8(response, 300)
 
         status = response.status_code
         lowered = message.lower()
@@ -10671,9 +11106,7 @@ def stream_groq_chat_completion(
                 yield friendly_api_error("groq", response=response)
                 return
 
-            for raw_line in response.iter_lines(decode_unicode=True):
-                if not raw_line:
-                    continue
+            for raw_line in iter_utf8_response_lines(response):
                 line = raw_line.strip()
                 if line.startswith("data:"):
                     line = line[5:].strip()
@@ -10998,6 +11431,13 @@ def create_database_backup(reason: str = "manual") -> dict[str, Any]:
             with sqlite3.connect(backup_path) as target:
                 source.backup(target)
     return {"path": str(backup_path), "created_at": now_iso(), "reason": reason}
+
+
+def public_backup_payload(backup: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "created_at": backup.get("created_at"),
+        "reason": backup.get("reason") or "manual",
+    }
 
 
 def summarize_chat(old_summary: str, messages: list[dict[str, Any]]) -> str:
@@ -11334,9 +11774,15 @@ async def prepare_chat(
     document_result = None
 
     if isinstance(active_file, dict):
+        active_file_path = Path(active_file.get("path", ""))
+        if active_file.get("storage_path"):
+            active_file_path = restore_local_cache_from_storage(
+                active_file_path,
+                active_file.get("storage_path"),
+            )
         document_result = process_document_tool(
             profile_id,
-            Path(active_file.get("path", "")),
+            active_file_path,
             active_file.get("name", ""),
             user_message,
         )
@@ -11355,7 +11801,7 @@ async def prepare_chat(
             [],
             [],
             [],
-            "__DOCUMENT_TOOL__" + json.dumps(document_result),
+            "__DOCUMENT_TOOL__" + encode_json(document_result),
             {"used": False, "coverage": "document_tool", "sourceCount": 0, "grounded": False},
         )
 
@@ -11447,7 +11893,7 @@ def health() -> dict[str, Any]:
         "search_available": DDGS is not None,
         "ocr_available": ocr_available(),
         "ocr_python_package_available": pytesseract is not None,
-        "tesseract_cmd": TESSERACT_CMD,
+        "tesseract_cmd_configured": bool(TESSERACT_CMD),
         "docx_pdf_available": cloud_docx_to_pdf_available() or local_docx_to_pdf_available(),
         "docx_pdf_mode": "cloud" if cloud_docx_to_pdf_available() else "local-pandoc-prince" if local_docx_to_pdf_available() else "unavailable",
         "pdf_docx_available": True,
@@ -11645,6 +12091,71 @@ def login_profile(
     return {"profile": public_profile(profile), "token": token, "session_mode": "profile"}
 
 
+@app.post("/profiles/current/avatar")
+async def upload_current_profile_avatar(
+    request: Request,
+    file: UploadFile = File(...),
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
+    profile = require_profile(authorization)
+    enforce_rate_limit(request, "upload", profile)
+    if not supabase_storage_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase Storage is not configured for profile images.",
+        )
+    extension, mime_type, file_bytes = await validate_profile_image_upload(file)
+    object_name = f"{uuid.uuid4().hex}{extension}"
+    storage_path = upload_profile_asset_bytes(
+        profile_storage_object_path(profile["id"], "avatars", object_name),
+        file_bytes,
+        mime_type,
+    )
+    if not storage_path:
+        raise HTTPException(status_code=503, detail="Supabase Storage is not configured.")
+    old_storage_path = profile.get("profile_image_storage_path")
+    updated_profile = update_profile_image_metadata(profile["id"], storage_path, mime_type)
+    if old_storage_path and old_storage_path != storage_path:
+        delete_profile_asset(old_storage_path)
+    log_activity(profile["id"], "profile_avatar_updated", {})
+    return {
+        "profile": public_profile(updated_profile),
+        "avatar_url": retrieve_profile_image_url(updated_profile),
+    }
+
+
+@app.delete("/profiles/current/avatar")
+def delete_current_profile_avatar(authorization: str | None = Header(None)) -> dict[str, Any]:
+    profile = require_profile(authorization)
+    old_storage_path = profile.get("profile_image_storage_path")
+    updated_profile = update_profile_image_metadata(profile["id"], None, None)
+    if old_storage_path:
+        delete_profile_asset(old_storage_path)
+    log_activity(profile["id"], "profile_avatar_deleted", {})
+    return {"profile": public_profile(updated_profile)}
+
+
+@app.get("/profiles/{profile_id}/avatar")
+def get_profile_avatar(
+    profile_id: str,
+    request: Request,
+    authorization: str | None = Header(None),
+):
+    current_profile = require_account_or_profile_session(authorization)
+    target_profile = require_profile_avatar_access(profile_id, current_profile, request)
+    storage_path = target_profile.get("profile_image_storage_path")
+    if not storage_path:
+        raise HTTPException(status_code=404, detail="Profile image not found.")
+    image_bytes = download_profile_asset_bytes(storage_path)
+    if image_bytes is None:
+        raise HTTPException(status_code=404, detail="Profile image not found.")
+    return Response(
+        content=image_bytes,
+        media_type=target_profile.get("profile_image_mime_type") or "image/png",
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+
+
 @app.delete("/profiles/current")
 def delete_current_profile(
     data: ProfileDeleteRequest,
@@ -11678,6 +12189,7 @@ def delete_current_profile(
 
     profile_id = profile["id"]
     profile_name = profile.get("name", "Profile")
+    old_profile_image = profile.get("profile_image_storage_path")
     with DATA_LOCK:
         with db_connect() as conn:
             conn.execute("DELETE FROM sessions WHERE profile_id = ?", (profile_id,))
@@ -11698,6 +12210,8 @@ def delete_current_profile(
         raise HTTPException(status_code=404, detail=DEVICE_PROFILE_NOT_FOUND)
 
     remove_profile_storage(profile_id)
+    if old_profile_image:
+        delete_profile_asset(old_profile_image)
     log_activity(account_profile["id"], "profile_deleted", {"profile": profile_name})
     return {
         "ok": True,
@@ -11725,43 +12239,17 @@ def start_profile_pin_reset(
     if not user:
         raise HTTPException(status_code=401, detail="Signed-in account no longer exists.")
 
-    require_email_service_configured()
-    code = generate_pin_reset_code()
-    expires_at = store_profile_pin_reset_code(
-        user_id=user_id,
-        profile_id=profile["id"],
-        device_id=device_id,
-        code=code,
-    )
-    try:
-        send_pin_reset_email(
-            to_email=user["email"],
-            profile_name=profile.get("name", "Profile"),
-            code=code,
-        )
-    except HTTPException:
-        invalidate_profile_pin_reset_codes(
-            user_id=user_id,
-            profile_id=profile["id"],
-            device_id=device_id,
-        )
-        raise
-
     log_activity(
         user["workspace_profile_id"],
         "profile_pin_reset_started",
         {"profile_id": profile["id"]},
     )
 
-    response: dict[str, Any] = {
+    return {
         "ok": True,
-        "email": user["email"],
-        "expires_at": expires_at,
-        "expires_in_seconds": PIN_RESET_CODE_TTL_SECONDS,
-        "message": f"Verification code sent to {user['email']}.",
-        "delivery": "resend",
+        "message": "Send and verify the account email OTP with Supabase Auth before resetting the PIN.",
+        "delivery": "supabase_auth",
     }
-    return response
 
 
 @app.post("/profiles/pin-reset/verify")
@@ -11777,14 +12265,11 @@ def verify_profile_pin_reset(
     if not user_id or not device_id:
         raise HTTPException(status_code=403, detail="Sign in on this device to reset a profile PIN.")
 
-    profile = get_owned_device_profile(data.profile_id, user_id, device_id)
-    verify_profile_pin_reset_code(
-        user_id=user_id,
-        profile_id=profile["id"],
-        device_id=device_id,
-        code=data.code,
+    get_owned_device_profile(data.profile_id, user_id, device_id)
+    raise HTTPException(
+        status_code=410,
+        detail="PIN reset verification now uses Supabase Auth OTP.",
     )
-    return {"ok": True, "message": "Verification code confirmed."}
 
 
 @app.post("/profiles/pin-reset/complete")
@@ -11808,19 +12293,19 @@ def complete_profile_pin_reset(
     user = find_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="Signed-in account no longer exists.")
+
+    identity = verify_supabase_access_token(data.account_access_token)
+    if (
+        identity.get("auth_user_id") != user.get("auth_user_id")
+        or identity.get("email") != user.get("email")
+    ):
+        raise HTTPException(status_code=403, detail="Account verification could not be confirmed.")
+
     account_token = create_account_session(user_id)
     account_profile = account_workspace_profile(user)
     if not account_profile:
         delete_session(account_token)
         raise HTTPException(status_code=500, detail="Account workspace could not be prepared.")
-
-    verify_profile_pin_reset_code(
-        user_id=user_id,
-        profile_id=profile["id"],
-        device_id=device_id,
-        code=data.code,
-        mark_used=True,
-    )
 
     salt = secrets.token_hex(16)
     with DATA_LOCK:
@@ -11983,11 +12468,15 @@ def admin_overview(authorization: str | None = Header(None)) -> dict[str, Any]:
 
 
 @app.post("/admin/backup")
-def admin_backup(authorization: str | None = Header(None)) -> dict[str, Any]:
+def admin_backup(
+    request: Request,
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
     profile = require_profile(authorization)
+    enforce_rate_limit(request, "admin", profile)
     backup = create_database_backup("manual")
-    log_activity(profile["id"], "database_backup", {"path": backup["path"]})
-    return {"ok": True, "backup": backup}
+    log_activity(profile["id"], "database_backup", {"reason": backup["reason"]})
+    return {"ok": True, "backup": public_backup_payload(backup)}
 
 
 @app.get("/settings")
@@ -12099,18 +12588,16 @@ def download_file(
     folder_path = ensure_controlled_file_path(PROCESSED_DIR / safe_folder_id)
     file_path = ensure_controlled_file_path(folder_path / safe_filename)
 
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-
     scope = ownership_scope_for_profile(profile["id"])
     owner_clause, owner_params = owner_where(scope)
+    owned_file_row = None
     with DATA_LOCK:
         with db_connect() as conn:
-            owned_file = conn.execute(
-                f"SELECT id FROM files WHERE path = ? AND {owner_clause}",
+            owned_file_row = conn.execute(
+                f"SELECT * FROM files WHERE path = ? AND {owner_clause}",
                 (str(file_path), *owner_params),
             ).fetchone()
-            if not owned_file:
+            if not owned_file_row:
                 for row in conn.execute(
                     f"SELECT payload FROM messages WHERE {owner_clause}",
                     owner_params,
@@ -12125,29 +12612,48 @@ def download_file(
                             safe_filename,
                             scope=scope,
                         )
-                        owned_file = True
+                        owned_file_row = conn.execute(
+                            f"SELECT * FROM files WHERE path = ? AND {owner_clause}",
+                            (str(file_path), *owner_params),
+                        ).fetchone()
                         break
 
-    if not owned_file:
+    if not owned_file_row:
         raise HTTPException(
             status_code=403,
             detail="Unauthorized download. This file does not belong to your workspace.",
         )
 
-    return FileResponse(
-        path=str(file_path),
-        filename=safe_filename,
-        media_type=CANONICAL_UPLOAD_MIME_TYPES.get(
+    media_type = (
+        owned_file_row["mime_type"]
+        if "mime_type" in owned_file_row.keys() and owned_file_row["mime_type"]
+        else CANONICAL_UPLOAD_MIME_TYPES.get(
             suffix,
             "text/plain; charset=utf-8" if suffix in GENERATED_CODE_DOWNLOAD_EXTENSIONS else "application/octet-stream",
-        ),
+        )
+    )
+    if file_path.exists():
+        return FileResponse(path=str(file_path), filename=safe_filename, media_type=media_type)
+
+    storage_path = owned_file_row["storage_path"] if "storage_path" in owned_file_row.keys() else ""
+    storage_bytes = download_profile_asset_bytes(storage_path)
+    if storage_bytes is None:
+        raise HTTPException(status_code=404, detail="File not found.")
+    return Response(
+        content=storage_bytes,
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )
 
 
 @app.get("/chats")
 def get_chats(authorization: str | None = Header(None)) -> dict[str, list[dict[str, Any]]]:
     profile = require_workspace_session(authorization)
-    return {"chats": load_chat_metadata(profile["id"], ownership_scope_from_profile(profile))}
+    return {
+        "chats": public_chat_list(
+            load_chat_metadata(profile["id"], ownership_scope_from_profile(profile))
+        )
+    }
 
 
 @app.post("/chats/new")
@@ -12204,7 +12710,7 @@ def delete_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[
                 f"DELETE FROM chats WHERE {owner_clause} AND id = ?",
                 (*owner_params, chat_id),
             )
-    return {"chats": load_chats(profile["id"])}
+    return {"chats": public_chat_list(load_chats(profile["id"]))}
 
 
 @app.get("/chats/{chat_id}")
@@ -12212,10 +12718,12 @@ def get_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[str
     profile = require_workspace_session(authorization)
     chat_id = validate_chat_id(chat_id)
     return {
-        "chat": load_chat_by_id(
-            profile["id"],
-            chat_id,
-            ownership_scope_from_profile(profile),
+        "chat": public_chat_payload(
+            load_chat_by_id(
+                profile["id"],
+                chat_id,
+                ownership_scope_from_profile(profile),
+            )
         )
     }
 
@@ -12255,7 +12763,11 @@ def export_chat(chat_id: str, authorization: str | None = Header(None)):
 @app.get("/code/chats")
 def get_code_chats(authorization: str | None = Header(None)) -> dict[str, list[dict[str, Any]]]:
     profile = require_workspace_session(authorization)
-    return {"chats": load_code_chat_metadata(profile["id"], ownership_scope_from_profile(profile))}
+    return {
+        "chats": public_code_chat_list(
+            load_code_chat_metadata(profile["id"], ownership_scope_from_profile(profile))
+        )
+    }
 
 
 @app.post("/code/chats/new")
@@ -12297,7 +12809,7 @@ def update_code_chat(
         chat_item["pinned"] = data.pinned
 
     saved = save_current_code_chat(profile["id"], chats, chat_item)
-    return {"chat": chat_item, "chats": saved}
+    return {"chat": public_code_chat_payload(chat_item), "chats": saved}
 
 
 @app.delete("/code/chats/{chat_id}")
@@ -12312,7 +12824,7 @@ def delete_code_chat(chat_id: str, authorization: str | None = Header(None)) -> 
                 f"DELETE FROM code_chats WHERE {owner_clause} AND id = ?",
                 (*owner_params, chat_id),
             )
-    return {"chats": load_code_chats(profile["id"])}
+    return {"chats": public_code_chat_list(load_code_chats(profile["id"]))}
 
 
 @app.get("/code/chats/{chat_id}")
@@ -12320,10 +12832,12 @@ def get_code_chat(chat_id: str, authorization: str | None = Header(None)) -> dic
     profile = require_workspace_session(authorization)
     chat_id = validate_chat_id(chat_id)
     return {
-        "chat": load_code_chat_by_id(
-            profile["id"],
-            chat_id,
-            ownership_scope_from_profile(profile),
+        "chat": public_code_chat_payload(
+            load_code_chat_by_id(
+                profile["id"],
+                chat_id,
+                ownership_scope_from_profile(profile),
+            )
         )
     }
 
@@ -12427,7 +12941,7 @@ async def code_chat_stream(
                 "workspace": "code",
                 "projectFiles": saved_project_files,
             }
-            yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+            yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
             def persist_and_log() -> None:
                 persist_started = time.perf_counter()
@@ -12471,7 +12985,7 @@ async def code_chat_stream(
                 "workspace": "code",
                 "projectFiles": saved_project_files,
             }
-            yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+            yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
             def persist_and_log() -> None:
                 persist_started = time.perf_counter()
@@ -12522,7 +13036,7 @@ async def code_chat_stream(
                 "workspace": "code",
                 "projectFiles": relevant_project_files,
             }
-            yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+            yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
             def persist_and_log() -> None:
                 persist_started = time.perf_counter()
@@ -12574,7 +13088,7 @@ async def code_chat_stream(
         generated_files = save_generated_code_files(profile_id, current_chat["id"], user_message, final_text)
         if generated_files:
             meta["generatedFiles"] = generated_files
-        yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+        yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
         def persist_and_log() -> None:
             persist_started = time.perf_counter()
@@ -13043,7 +13557,7 @@ async def chat_stream(
         )
         metrics["persist_ms"] = elapsed_ms(persist_started)
         log_stream_timing("/chat-stream", metrics)
-        return JSONResponse(
+        return UTF8JSONResponse(
             response_payload
         )
 
@@ -13059,7 +13573,7 @@ async def chat_stream(
         )
         metrics["persist_ms"] = elapsed_ms(persist_started)
         log_stream_timing("/chat-stream", metrics)
-        return JSONResponse(
+        return UTF8JSONResponse(
             response_payload
         )
 
@@ -13116,7 +13630,7 @@ async def chat_stream(
         )
         metrics["persist_ms"] = elapsed_ms(persist_started)
         log_stream_timing("/chat-stream", metrics)
-        return JSONResponse(
+        return UTF8JSONResponse(
             {
                 "response": clarification,
                 "chat": public_chat_payload(current_chat),
@@ -13143,7 +13657,7 @@ async def chat_stream(
         )
         metrics["persist_ms"] = elapsed_ms(persist_started)
         log_stream_timing("/chat-stream", metrics)
-        return JSONResponse(
+        return UTF8JSONResponse(
             {
                 "response": direct_response,
                 "chat": public_chat_payload(current_chat),
@@ -13199,7 +13713,7 @@ async def chat_stream(
             "research": research,
             "suggestions": suggestions,
         }
-        yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+        yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
         def persist_and_log() -> None:
             persist_started = time.perf_counter()
