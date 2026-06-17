@@ -71,6 +71,8 @@ except Exception:
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
+APP_ENV = os.getenv("APP_ENV", os.getenv("FEBGUY_ENV", "development")).strip().lower()
+IS_PRODUCTION = APP_ENV in {"production", "prod"}
 DATA_DIR = Path(os.getenv("FEBGUY_DATA_DIR", BASE_DIR))
 PROCESSED_DIR = DATA_DIR / "processed_files"
 PROFILES_DIR = DATA_DIR / "profiles"
@@ -391,6 +393,12 @@ MAX_CODE_CONTEXT_CHARS = env_positive_int("FEBGUY_MAX_CODE_CONTEXT_CHARS", 18000
 MAX_GENERATED_CODE_FILES = 4
 
 DEFAULT_CORS_ORIGINS = "http://localhost:5173,http://127.0.0.1:5173"
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
+    "X-Frame-Options": "DENY",
+}
 RATE_LIMIT_RULES: dict[str, tuple[int, int]] = {
     "login": (env_positive_int("FEBGUY_RATE_LOGIN_REQUESTS", 10), 300),
     "profile_pin": (env_positive_int("FEBGUY_RATE_PIN_REQUESTS", 8), 300),
@@ -398,6 +406,7 @@ RATE_LIMIT_RULES: dict[str, tuple[int, int]] = {
     "guest_chat": (env_positive_int("FEBGUY_RATE_GUEST_CHAT_REQUESTS", 20), 60),
     "upload": (env_positive_int("FEBGUY_RATE_UPLOAD_REQUESTS", 15), 60),
     "ai": (env_positive_int("FEBGUY_RATE_AI_REQUESTS", 45), 60),
+    "admin": (env_positive_int("FEBGUY_RATE_ADMIN_REQUESTS", 5), 3600),
 }
 RATE_LIMIT_LABELS = {
     "login": "sign-in attempts",
@@ -406,6 +415,7 @@ RATE_LIMIT_LABELS = {
     "guest_chat": "guest messages",
     "upload": "file uploads",
     "ai": "AI requests",
+    "admin": "administrative requests",
 }
 # This process-local limiter protects a single backend instance. Use a shared
 # limiter when running multiple production workers.
@@ -646,6 +656,8 @@ def structured_error_response(
     response_headers = dict(headers or {})
     if request_id:
         response_headers["X-Request-ID"] = request_id
+    for header, value in SECURITY_HEADERS.items():
+        response_headers.setdefault(header, value)
     return JSONResponse(
         status_code=status_code,
         content={"ok": False, "error": error, "detail": message},
@@ -705,13 +717,31 @@ def validate_message_length(message: str) -> str:
 
 
 app = FastAPI(title="FebGuy AI Backend")
-ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS).split(",")
-    if origin.strip()
-]
-if "*" in ALLOWED_ORIGINS:
-    LOGGER.warning("CORS_ORIGINS contains '*'. Configure explicit production origins before deployment.")
+
+
+def parse_cors_origins(raw_origins: str) -> list[str]:
+    origins: list[str] = []
+    for raw_origin in raw_origins.split(","):
+        origin = raw_origin.strip().rstrip("/")
+        if not origin:
+            continue
+        if origin == "*":
+            if IS_PRODUCTION:
+                LOGGER.warning("Ignoring wildcard CORS origin in production.")
+                continue
+            return ["*"]
+        parsed = urlparse(origin)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            LOGGER.warning("Ignoring invalid CORS origin: %s", origin)
+            continue
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+ALLOWED_ORIGINS = parse_cors_origins(os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS))
+if IS_PRODUCTION and not ALLOWED_ORIGINS:
+    LOGGER.warning("No explicit CORS_ORIGINS configured for production.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -807,6 +837,9 @@ async def attach_device_context(request: Request, call_next):
         )
     try:
         response = await call_next(request)
+        for header, value in SECURITY_HEADERS.items():
+            if header not in response.headers:
+                response.headers[header] = value
         return response
     finally:
         total_ms = (time.perf_counter() - started_at) * 1000
@@ -5291,8 +5324,77 @@ def sort_chats(chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return pinned + unpinned
 
 
+PRIVATE_UPLOAD_METADATA_KEYS = {
+    "path",
+    "storage_path",
+    "storage_provider",
+    "storageProvider",
+    "storageBucket",
+    "context",
+    "content",
+    "raw_text",
+    "rawText",
+    "chunks",
+}
+
+
+def strip_private_file_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: strip_private_file_metadata(item)
+            for key, item in value.items()
+            if key not in PRIVATE_UPLOAD_METADATA_KEYS and not str(key).startswith("_")
+        }
+    if isinstance(value, list):
+        return [strip_private_file_metadata(item) for item in value]
+    return value
+
+
+def public_uploaded_file_payload(uploaded_file: Any) -> dict[str, Any] | None:
+    if not isinstance(uploaded_file, dict):
+        return None
+
+    payload: dict[str, Any] = {}
+    for key in ("name", "type", "document_id", "page_count", "is_image", "used_ocr"):
+        value = uploaded_file.get(key)
+        if value is not None and value != "":
+            payload[key] = value
+
+    chunks = uploaded_file.get("chunks")
+    if isinstance(chunks, list):
+        payload["chunk_count"] = len(chunks)
+
+    return payload or None
+
+
 def public_chat_payload(chat_item: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in chat_item.items() if not str(key).startswith("_")}
+    payload: dict[str, Any] = {}
+    for key, value in chat_item.items():
+        if str(key).startswith("_"):
+            continue
+        if key == "last_uploaded_file":
+            payload[key] = public_uploaded_file_payload(value)
+        elif key == "messages" and isinstance(value, list):
+            payload[key] = [strip_private_file_metadata(message) for message in value]
+        else:
+            payload[key] = strip_private_file_metadata(value)
+    return payload
+
+
+def public_chat_list(chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [public_chat_payload(chat_item) for chat_item in chats]
+
+
+def public_code_chat_payload(chat_item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: strip_private_file_metadata(value)
+        for key, value in chat_item.items()
+        if not str(key).startswith("_")
+    }
+
+
+def public_code_chat_list(chats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [public_code_chat_payload(chat_item) for chat_item in chats]
 
 
 def load_chats(profile_id: str) -> list[dict[str, Any]]:
@@ -5500,7 +5602,7 @@ def save_current_chat(
                 ]
             else:
                 upsert_chat_row(conn, profile_id, current_chat, scope)
-    return load_chat_metadata(profile_id) if reload_metadata else []
+    return public_chat_list(load_chat_metadata(profile_id)) if reload_metadata else []
 
 
 def load_code_chats(profile_id: str) -> list[dict[str, Any]]:
@@ -5738,7 +5840,7 @@ def save_current_code_chat(
                 current_chat["projectFiles"] = current_chat.get("projectFiles", [])
             else:
                 upsert_code_chat_row(conn, profile_id, current_chat, scope)
-    return load_code_chat_metadata(profile_id) if reload_metadata else []
+    return public_code_chat_list(load_code_chat_metadata(profile_id)) if reload_metadata else []
 
 
 def safe_code_file_name(raw_name: str | None, fallback: str = "code.txt") -> str:
@@ -5916,7 +6018,7 @@ async def validate_code_context_upload(file: UploadFile) -> tuple[str, str, str]
     if file_type not in CODE_CONTEXT_MIME_TYPES and not file_type.startswith("text/"):
         raise HTTPException(status_code=415, detail=f"{file_name} is not a supported text/code file.")
 
-    content_bytes = await file.read()
+    content_bytes = await file.read(MAX_CODE_CONTEXT_FILE_BYTES + 1)
     if not content_bytes:
         raise HTTPException(status_code=400, detail=f"{file_name} is empty.")
     if len(content_bytes) > MAX_CODE_CONTEXT_FILE_BYTES:
@@ -11301,6 +11403,13 @@ def create_database_backup(reason: str = "manual") -> dict[str, Any]:
     return {"path": str(backup_path), "created_at": now_iso(), "reason": reason}
 
 
+def public_backup_payload(backup: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "created_at": backup.get("created_at"),
+        "reason": backup.get("reason") or "manual",
+    }
+
+
 def summarize_chat(old_summary: str, messages: list[dict[str, Any]]) -> str:
     if len(messages) < 6:
         return old_summary
@@ -11754,7 +11863,7 @@ def health() -> dict[str, Any]:
         "search_available": DDGS is not None,
         "ocr_available": ocr_available(),
         "ocr_python_package_available": pytesseract is not None,
-        "tesseract_cmd": TESSERACT_CMD,
+        "tesseract_cmd_configured": bool(TESSERACT_CMD),
         "docx_pdf_available": cloud_docx_to_pdf_available() or local_docx_to_pdf_available(),
         "docx_pdf_mode": "cloud" if cloud_docx_to_pdf_available() else "local-pandoc-prince" if local_docx_to_pdf_available() else "unavailable",
         "pdf_docx_available": True,
@@ -11954,10 +12063,12 @@ def login_profile(
 
 @app.post("/profiles/current/avatar")
 async def upload_current_profile_avatar(
+    request: Request,
     file: UploadFile = File(...),
     authorization: str | None = Header(None),
 ) -> dict[str, Any]:
     profile = require_profile(authorization)
+    enforce_rate_limit(request, "upload", profile)
     if not supabase_storage_configured():
         raise HTTPException(
             status_code=503,
@@ -12327,11 +12438,15 @@ def admin_overview(authorization: str | None = Header(None)) -> dict[str, Any]:
 
 
 @app.post("/admin/backup")
-def admin_backup(authorization: str | None = Header(None)) -> dict[str, Any]:
+def admin_backup(
+    request: Request,
+    authorization: str | None = Header(None),
+) -> dict[str, Any]:
     profile = require_profile(authorization)
+    enforce_rate_limit(request, "admin", profile)
     backup = create_database_backup("manual")
-    log_activity(profile["id"], "database_backup", {"path": backup["path"]})
-    return {"ok": True, "backup": backup}
+    log_activity(profile["id"], "database_backup", {"reason": backup["reason"]})
+    return {"ok": True, "backup": public_backup_payload(backup)}
 
 
 @app.get("/settings")
@@ -12504,7 +12619,11 @@ def download_file(
 @app.get("/chats")
 def get_chats(authorization: str | None = Header(None)) -> dict[str, list[dict[str, Any]]]:
     profile = require_workspace_session(authorization)
-    return {"chats": load_chat_metadata(profile["id"], ownership_scope_from_profile(profile))}
+    return {
+        "chats": public_chat_list(
+            load_chat_metadata(profile["id"], ownership_scope_from_profile(profile))
+        )
+    }
 
 
 @app.post("/chats/new")
@@ -12561,7 +12680,7 @@ def delete_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[
                 f"DELETE FROM chats WHERE {owner_clause} AND id = ?",
                 (*owner_params, chat_id),
             )
-    return {"chats": load_chats(profile["id"])}
+    return {"chats": public_chat_list(load_chats(profile["id"]))}
 
 
 @app.get("/chats/{chat_id}")
@@ -12569,10 +12688,12 @@ def get_chat(chat_id: str, authorization: str | None = Header(None)) -> dict[str
     profile = require_workspace_session(authorization)
     chat_id = validate_chat_id(chat_id)
     return {
-        "chat": load_chat_by_id(
-            profile["id"],
-            chat_id,
-            ownership_scope_from_profile(profile),
+        "chat": public_chat_payload(
+            load_chat_by_id(
+                profile["id"],
+                chat_id,
+                ownership_scope_from_profile(profile),
+            )
         )
     }
 
@@ -12612,7 +12733,11 @@ def export_chat(chat_id: str, authorization: str | None = Header(None)):
 @app.get("/code/chats")
 def get_code_chats(authorization: str | None = Header(None)) -> dict[str, list[dict[str, Any]]]:
     profile = require_workspace_session(authorization)
-    return {"chats": load_code_chat_metadata(profile["id"], ownership_scope_from_profile(profile))}
+    return {
+        "chats": public_code_chat_list(
+            load_code_chat_metadata(profile["id"], ownership_scope_from_profile(profile))
+        )
+    }
 
 
 @app.post("/code/chats/new")
@@ -12654,7 +12779,7 @@ def update_code_chat(
         chat_item["pinned"] = data.pinned
 
     saved = save_current_code_chat(profile["id"], chats, chat_item)
-    return {"chat": chat_item, "chats": saved}
+    return {"chat": public_code_chat_payload(chat_item), "chats": saved}
 
 
 @app.delete("/code/chats/{chat_id}")
@@ -12669,7 +12794,7 @@ def delete_code_chat(chat_id: str, authorization: str | None = Header(None)) -> 
                 f"DELETE FROM code_chats WHERE {owner_clause} AND id = ?",
                 (*owner_params, chat_id),
             )
-    return {"chats": load_code_chats(profile["id"])}
+    return {"chats": public_code_chat_list(load_code_chats(profile["id"]))}
 
 
 @app.get("/code/chats/{chat_id}")
@@ -12677,10 +12802,12 @@ def get_code_chat(chat_id: str, authorization: str | None = Header(None)) -> dic
     profile = require_workspace_session(authorization)
     chat_id = validate_chat_id(chat_id)
     return {
-        "chat": load_code_chat_by_id(
-            profile["id"],
-            chat_id,
-            ownership_scope_from_profile(profile),
+        "chat": public_code_chat_payload(
+            load_code_chat_by_id(
+                profile["id"],
+                chat_id,
+                ownership_scope_from_profile(profile),
+            )
         )
     }
 
