@@ -2785,7 +2785,7 @@ function App() {
       stopResponseAudio();
     }
 
-    const decoder = new TextDecoder();
+    const decoder = new TextDecoder("utf-8");
 
     const readNextChunk = async (state) => {
       const { done, value } = await reader.read();

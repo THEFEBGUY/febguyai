@@ -1,7 +1,7 @@
 {
   "name": "FebGuyAI",
   "short_name": "FebGuyAI",
-  "description": "FebGuyAI – AI Workspace for Chat, Coding, Documents, Voice and Productivity.",
+  "description": "FebGuyAI - AI Workspace for Chat, Coding, Documents, Voice and Productivity.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

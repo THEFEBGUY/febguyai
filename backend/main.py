@@ -153,6 +153,7 @@ CONTEXT_LIMIT = int(os.getenv("FEBGUY_CONTEXT_LIMIT", "12000"))
 META_PREFIX = "\n\n[[FEBGUY_META:"
 META_SUFFIX = "]]"
 STREAM_RESPONSE_HEADERS = {
+    "Content-Type": "text/plain; charset=utf-8",
     "Cache-Control": "no-cache, no-transform",
     "X-Accel-Buffering": "no",
 }
@@ -163,6 +164,19 @@ GUEST_USAGE_LIMITS = {
     "code": 4,
     "upload": 3,
 }
+
+
+class UTF8JSONResponse(JSONResponse):
+    media_type = "application/json; charset=utf-8"
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
 try:
     MAX_UPLOAD_MB = max(1, int(os.getenv("FEBGUY_MAX_UPLOAD_MB", "10") or "10"))
 except ValueError:
@@ -643,7 +657,7 @@ def structured_error_response(
     request: Request | None = None,
     code: str | None = None,
     headers: dict[str, str] | None = None,
-) -> JSONResponse:
+) -> UTF8JSONResponse:
     message = public_error_message(detail)
     error: dict[str, str] = {
         "code": code or error_code_for_status(status_code),
@@ -658,7 +672,7 @@ def structured_error_response(
         response_headers["X-Request-ID"] = request_id
     for header, value in SECURITY_HEADERS.items():
         response_headers.setdefault(header, value)
-    return JSONResponse(
+    return UTF8JSONResponse(
         status_code=status_code,
         content={"ok": False, "error": error, "detail": message},
         headers=response_headers,
@@ -716,7 +730,7 @@ def validate_message_length(message: str) -> str:
     return value
 
 
-app = FastAPI(title="FebGuy AI Backend")
+app = FastAPI(title="FebGuy AI Backend", default_response_class=UTF8JSONResponse)
 
 
 def parse_cors_origins(raw_origins: str) -> list[str]:
@@ -1048,6 +1062,24 @@ def encode_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
+def response_text_utf8(response: requests.Response, limit: int | None = None) -> str:
+    try:
+        text = response.content.decode("utf-8")
+    except UnicodeDecodeError:
+        text = ""
+    return text[:limit] if limit is not None else text
+
+
+def iter_utf8_response_lines(response: requests.Response) -> Iterable[str]:
+    for raw_line in response.iter_lines(decode_unicode=False):
+        if not raw_line:
+            continue
+        if isinstance(raw_line, bytes):
+            yield raw_line.decode("utf-8")
+        else:
+            yield str(raw_line)
+
+
 def decode_json(raw: str | None, default: Any) -> Any:
     if isinstance(raw, (dict, list)):
         return raw
@@ -1060,7 +1092,7 @@ def decode_json(raw: str | None, default: Any) -> Any:
 
 
 def clone_json_compatible(data: Any) -> Any:
-    return json.loads(json.dumps(data))
+    return json.loads(json.dumps(data, ensure_ascii=False))
 
 
 def elapsed_ms(started_at: float) -> float:
@@ -4951,7 +4983,7 @@ def cached_guest_usage_status(guest_id: str, device_id: str) -> dict[str, Any] |
         if time.monotonic() - float(cached.get("checked_at") or 0.0) > GUEST_USAGE_STATUS_CACHE_SECONDS:
             GUEST_USAGE_STATUS_CACHE.pop(key, None)
             return None
-        return json.loads(json.dumps(cached["status"]))
+        return json.loads(json.dumps(cached["status"], ensure_ascii=False))
 
 
 def cache_guest_usage_status(guest_id: str, device_id: str, status: dict[str, Any]) -> None:
@@ -4959,7 +4991,7 @@ def cache_guest_usage_status(guest_id: str, device_id: str, status: dict[str, An
     with GUEST_USAGE_STATUS_LOCK:
         GUEST_USAGE_STATUS_CACHE[key] = {
             "checked_at": time.monotonic(),
-            "status": json.loads(json.dumps(status)),
+            "status": json.loads(json.dumps(status, ensure_ascii=False)),
         }
 
 
@@ -7196,7 +7228,7 @@ def storage_upload_failure_detail(response: requests.Response, content_type: str
                 or ""
             )
     except ValueError:
-        message = response.text[:240]
+        message = response_text_utf8(response, 240)
     lowered = message.lower()
     if "mime" in lowered or "content type" in lowered or "not allowed" in lowered:
         return (
@@ -10877,7 +10909,7 @@ def friendly_api_error(provider: str, exc: Exception | None = None, response: re
             else:
                 message = str(error_payload)
         except Exception:
-            message = response.text[:300]
+            message = response_text_utf8(response, 300)
 
         status = response.status_code
         lowered = message.lower()
@@ -11074,9 +11106,7 @@ def stream_groq_chat_completion(
                 yield friendly_api_error("groq", response=response)
                 return
 
-            for raw_line in response.iter_lines(decode_unicode=True):
-                if not raw_line:
-                    continue
+            for raw_line in iter_utf8_response_lines(response):
                 line = raw_line.strip()
                 if line.startswith("data:"):
                     line = line[5:].strip()
@@ -11771,7 +11801,7 @@ async def prepare_chat(
             [],
             [],
             [],
-            "__DOCUMENT_TOOL__" + json.dumps(document_result),
+            "__DOCUMENT_TOOL__" + encode_json(document_result),
             {"used": False, "coverage": "document_tool", "sourceCount": 0, "grounded": False},
         )
 
@@ -12911,7 +12941,7 @@ async def code_chat_stream(
                 "workspace": "code",
                 "projectFiles": saved_project_files,
             }
-            yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+            yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
             def persist_and_log() -> None:
                 persist_started = time.perf_counter()
@@ -12955,7 +12985,7 @@ async def code_chat_stream(
                 "workspace": "code",
                 "projectFiles": saved_project_files,
             }
-            yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+            yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
             def persist_and_log() -> None:
                 persist_started = time.perf_counter()
@@ -13006,7 +13036,7 @@ async def code_chat_stream(
                 "workspace": "code",
                 "projectFiles": relevant_project_files,
             }
-            yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+            yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
             def persist_and_log() -> None:
                 persist_started = time.perf_counter()
@@ -13058,7 +13088,7 @@ async def code_chat_stream(
         generated_files = save_generated_code_files(profile_id, current_chat["id"], user_message, final_text)
         if generated_files:
             meta["generatedFiles"] = generated_files
-        yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+        yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
         def persist_and_log() -> None:
             persist_started = time.perf_counter()
@@ -13527,7 +13557,7 @@ async def chat_stream(
         )
         metrics["persist_ms"] = elapsed_ms(persist_started)
         log_stream_timing("/chat-stream", metrics)
-        return JSONResponse(
+        return UTF8JSONResponse(
             response_payload
         )
 
@@ -13543,7 +13573,7 @@ async def chat_stream(
         )
         metrics["persist_ms"] = elapsed_ms(persist_started)
         log_stream_timing("/chat-stream", metrics)
-        return JSONResponse(
+        return UTF8JSONResponse(
             response_payload
         )
 
@@ -13600,7 +13630,7 @@ async def chat_stream(
         )
         metrics["persist_ms"] = elapsed_ms(persist_started)
         log_stream_timing("/chat-stream", metrics)
-        return JSONResponse(
+        return UTF8JSONResponse(
             {
                 "response": clarification,
                 "chat": public_chat_payload(current_chat),
@@ -13627,7 +13657,7 @@ async def chat_stream(
         )
         metrics["persist_ms"] = elapsed_ms(persist_started)
         log_stream_timing("/chat-stream", metrics)
-        return JSONResponse(
+        return UTF8JSONResponse(
             {
                 "response": direct_response,
                 "chat": public_chat_payload(current_chat),
@@ -13683,7 +13713,7 @@ async def chat_stream(
             "research": research,
             "suggestions": suggestions,
         }
-        yield f"{META_PREFIX}{json.dumps(meta)}{META_SUFFIX}"
+        yield f"{META_PREFIX}{encode_json(meta)}{META_SUFFIX}"
 
         def persist_and_log() -> None:
             persist_started = time.perf_counter()
