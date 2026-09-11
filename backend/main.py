@@ -132,8 +132,8 @@ API_PUBLIC_BASE_URL = os.getenv("API_PUBLIC_BASE_URL", "http://127.0.0.1:8000")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-DEFAULT_MODEL = os.getenv("CHAT_MODEL", "llama-3.1-8b-instant")
-CODE_MODEL = os.getenv("CODE_MODEL", "qwen/qwen3-32b")
+DEFAULT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b")
+CODE_MODEL = os.getenv("CODE_MODEL", "openai/gpt-oss-120b")
 VISION_MODEL = os.getenv("VISION_MODEL", "gemini-2.0-flash")
 GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
 STT_PROVIDER = os.getenv("STT_PROVIDER", "groq").lower()
@@ -241,33 +241,33 @@ def select_chat_model(
     has_search_context: bool = False,
     has_images: bool = False,
     is_voice: bool = False,
-) -> str:
+) -> tuple[str, str]:
     """Pick a configured model tier without breaking existing default routing."""
     mode = normalize_response_mode(response_mode)
     quality_mode = normalize_model_mode(model_mode) if model_mode is not None else ""
     normalized_intent = (intent or "").strip().lower()
     normalized_answer_mode = (answer_mode or "").strip().lower()
 
-    def configured(model_name: str | None, fallback: str = DEFAULT_MODEL) -> str:
-        return (model_name or "").strip() or fallback
+    def configured(model_name: str | None, fallback: str = DEFAULT_MODEL, effort: str = "low") -> tuple[str, str]:
+        return ((model_name or "").strip() or fallback, effort)
 
     if has_images:
-        return configured(VISION_MODEL, DEFAULT_MODEL)
+        return configured(VISION_MODEL, DEFAULT_MODEL, "low")
     if mode == "coding" or normalized_intent in {"coding_help", "code_help", "coding", "code"}:
-        return configured(CODE_MODEL, DEFAULT_MODEL)
+        return configured(CODE_MODEL, DEFAULT_MODEL, "high")
     if quality_mode == "fast":
-        return configured(FAST_MODEL, DEFAULT_MODEL)
+        return configured(FAST_MODEL, DEFAULT_MODEL, "low")
     if quality_mode == "smart":
-        return configured(SMART_MODEL, DEFAULT_MODEL)
+        return configured(SMART_MODEL, DEFAULT_MODEL, "medium")
     if quality_mode == "deep":
-        return configured(DEEP_MODEL, SMART_MODEL or DEFAULT_MODEL)
+        return configured(DEEP_MODEL, SMART_MODEL or DEFAULT_MODEL, "high")
     if is_voice:
-        return configured(VOICE_CHAT_MODEL, FAST_MODEL or DEFAULT_MODEL)
+        return configured(VOICE_CHAT_MODEL, FAST_MODEL or DEFAULT_MODEL, "low")
     if mode == "deep" or normalized_answer_mode in {"deep", "detailed"}:
-        return configured(DEEP_MODEL, SMART_MODEL or DEFAULT_MODEL)
+        return configured(DEEP_MODEL, SMART_MODEL or DEFAULT_MODEL, "high")
     if has_file_context or has_search_context or mode in {"teacher", "creative", "human"}:
-        return configured(SMART_MODEL, DEFAULT_MODEL)
-    return configured(DEFAULT_MODEL)
+        return configured(SMART_MODEL, DEFAULT_MODEL, "medium")
+    return configured(DEFAULT_MODEL, DEFAULT_MODEL, "low")
 MAX_IMAGE_PIXELS = 40_000_000
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".txt"}
 DISALLOWED_UPLOAD_EXTENSIONS = {".exe", ".bat", ".cmd", ".sh", ".zip"}
@@ -10893,7 +10893,7 @@ Recent messages:
 Code Studio summary:
 """.strip()
 
-    return clip_text(call_text_model(prompt, model=CODE_MODEL), 1200)
+    return clip_text(call_text_model(prompt, model=CODE_MODEL, reasoning_effort="high"), 1200)
 
 
 def friendly_api_error(provider: str, exc: Exception | None = None, response: requests.Response | None = None) -> str:
@@ -11029,9 +11029,12 @@ def vision_model_candidates() -> list[str]:
     return unique
 
 
-def apply_reasoning_controls(payload: dict[str, Any], model: str) -> None:
-    if "qwen3" in str(model or "").lower():
+def apply_reasoning_controls(payload: dict[str, Any], model: str, reasoning_effort: str | None = None) -> None:
+    model_str = str(model or "").lower()
+    if "qwen3" in model_str:
         payload["reasoning_format"] = "hidden"
+    if "gpt-oss" in model_str and reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
 
 
 def groq_chat_completion(
@@ -11039,6 +11042,7 @@ def groq_chat_completion(
     model: str = DEFAULT_MODEL,
     temperature: float = 0.65,
     timeout: tuple[int, int] = (8, 180),
+    reasoning_effort: str | None = None,
 ) -> str:
     if not GROQ_API_KEY:
         return "Groq API key is missing. Add GROQ_API_KEY to backend .env and restart the backend."
@@ -11053,7 +11057,7 @@ def groq_chat_completion(
         "top_p": 0.9,
         "stream": False,
     }
-    apply_reasoning_controls(payload, model)
+    apply_reasoning_controls(payload, model, reasoning_effort)
 
     try:
         response = requests.post(
@@ -11077,6 +11081,7 @@ def stream_groq_chat_completion(
     prompt: str,
     model: str = DEFAULT_MODEL,
     temperature: float = 0.65,
+    reasoning_effort: str | None = None,
 ) -> Iterable[str]:
     if not GROQ_API_KEY:
         yield "Groq API key is missing. Add GROQ_API_KEY to backend .env and restart the backend."
@@ -11092,7 +11097,7 @@ def stream_groq_chat_completion(
         "top_p": 0.9,
         "stream": True,
     }
-    apply_reasoning_controls(payload, model)
+    apply_reasoning_controls(payload, model, reasoning_effort)
 
     try:
         with requests.post(
@@ -11145,7 +11150,7 @@ def groq_vision_completion(prompt: str, image_parts: list[dict[str, str]]) -> st
     if not GROQ_API_KEY:
         return "Vision is unavailable because Gemini quota is exhausted and GROQ_API_KEY is missing."
     if not image_parts:
-        return groq_chat_completion(prompt, model=DEFAULT_MODEL)
+        return groq_chat_completion(prompt, model=DEFAULT_MODEL, reasoning_effort="low")
 
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for image in image_parts[:4]:
@@ -11190,7 +11195,7 @@ def groq_vision_completion(prompt: str, image_parts: list[dict[str, str]]) -> st
 def call_gemini_vision(prompt: str, images: list[Any] | None = None) -> str:
     image_parts = normalize_image_payloads(images)
     if not image_parts:
-        return groq_chat_completion(prompt, model=DEFAULT_MODEL)
+        return groq_chat_completion(prompt, model=DEFAULT_MODEL, reasoning_effort="low")
     if not GEMINI_API_KEY:
         return groq_vision_completion(prompt, image_parts)
 
@@ -11253,12 +11258,13 @@ def call_text_model(
     model: str = DEFAULT_MODEL,
     images: list[Any] | None = None,
     allow_image_fallback: bool = True,
+    reasoning_effort: str | None = None,
 ) -> str:
     started_at = time.perf_counter()
     try:
         if images:
             return call_gemini_vision(prompt, images)
-        return clean_model_output(groq_chat_completion(prompt, model=model))
+        return clean_model_output(groq_chat_completion(prompt, model=model, reasoning_effort=reasoning_effort))
     finally:
         add_request_ai_time(time.perf_counter() - started_at)
 
@@ -11330,7 +11336,7 @@ def refine_response_if_enabled(
             emotional_tone,
             intent,
         )
-        refined = clean_model_output(groq_chat_completion(prompt, model=RESPONSE_REFINER_MODEL)).strip()
+        refined = clean_model_output(groq_chat_completion(prompt, model=RESPONSE_REFINER_MODEL, reasoning_effort="low")).strip()
         if not refined or response_refiner_error(refined):
             return original_response
         return refined
@@ -11343,13 +11349,14 @@ def stream_text_model(
     model: str = DEFAULT_MODEL,
     images: list[Any] | None = None,
     allow_image_fallback: bool = True,
+    reasoning_effort: str | None = None,
 ) -> Iterable[str]:
     started_at = time.perf_counter()
     try:
         if images:
             yield call_gemini_vision(prompt, images)
             return
-        yield from without_thinking_stream(stream_groq_chat_completion(prompt, model=model))
+        yield from without_thinking_stream(stream_groq_chat_completion(prompt, model=model, reasoning_effort=reasoning_effort))
     finally:
         add_request_ai_time(time.perf_counter() - started_at)
 
@@ -11459,7 +11466,7 @@ Recent messages:
 Compressed summary:
 """.strip()
 
-    return clip_text(call_text_model(prompt), 1200)
+    return clip_text(call_text_model(prompt, reasoning_effort="low"), 1200)
 
 
 def create_title_from_message(message: str) -> str:
@@ -11470,7 +11477,7 @@ Only return the title.
 Message:
 {message}
 """.strip()
-    title = call_text_model(prompt).strip().strip('"')
+    title = call_text_model(prompt, reasoning_effort="low").strip().strip('"')
     return title[:40] if title else "New Chat"
 
 
@@ -13072,7 +13079,7 @@ async def code_chat_stream(
         ai_text = ""
         ai_started = time.perf_counter()
 
-        for chunk in stream_text_model(prompt, model=CODE_MODEL):
+        for chunk in stream_text_model(prompt, model=CODE_MODEL, reasoning_effort="high"):
             ai_text += chunk
             mark_stream_first_token(metrics)
             yield chunk
@@ -13285,7 +13292,7 @@ async def chat(
         research=research,
         conversation=conversation,
     )
-    model = select_chat_model(
+    model, effort = select_chat_model(
         response_mode=response_mode,
         model_mode=model_mode,
         intent=intent,
@@ -13294,7 +13301,7 @@ async def chat(
         has_search_context=bool(search_context),
         has_images=bool(image_payloads),
     )
-    ai_response = call_text_model(prompt, model=model, images=image_payloads or None)
+    ai_response = call_text_model(prompt, model=model, images=image_payloads or None, reasoning_effort=effort)
     ai_response = refine_response_if_enabled(
         ai_response,
         user_message,
@@ -13444,19 +13451,21 @@ async def voice_chat(
             research=research,
             conversation=conversation,
         )
+        model, effort = select_chat_model(
+            response_mode=response_mode,
+            model_mode=model_mode,
+            intent=intent,
+            answer_mode=answer_mode,
+            has_file_context=bool(file_context),
+            has_search_context=bool(search_context),
+            has_images=bool(image_payloads),
+            is_voice=True,
+        )
         ai_response = call_text_model(
             prompt,
-            model=select_chat_model(
-                response_mode=response_mode,
-                model_mode=model_mode,
-                intent=intent,
-                answer_mode=answer_mode,
-                has_file_context=bool(file_context),
-                has_search_context=bool(search_context),
-                has_images=bool(image_payloads),
-                is_voice=True,
-            ),
+            model=model,
             images=image_payloads or None,
+            reasoning_effort=effort,
         )
         used_model_response = True
 
@@ -13683,7 +13692,7 @@ async def chat_stream(
         research=research,
         conversation=conversation,
     )
-    model = select_chat_model(
+    model, effort = select_chat_model(
         response_mode=response_mode,
         model_mode=model_mode,
         intent=intent,
@@ -13697,7 +13706,7 @@ async def chat_stream(
         ai_text = ""
         ai_started = time.perf_counter()
 
-        for chunk in stream_text_model(prompt, model=model, images=image_payloads or None):
+        for chunk in stream_text_model(prompt, model=model, images=image_payloads or None, reasoning_effort=effort):
             ai_text += chunk
             mark_stream_first_token(metrics)
             yield chunk
