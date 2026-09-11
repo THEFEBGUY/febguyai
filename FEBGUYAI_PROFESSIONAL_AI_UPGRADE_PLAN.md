@@ -103,13 +103,13 @@ Use Groq or compatible OpenAI-style provider.
 Recommended `.env` model variables:
 
 ```env
-FAST_MODEL=llama-3.1-8b-instant
-SMART_MODEL=llama-3.3-70b-versatile
-DEEP_MODEL=llama-3.3-70b-versatile
-CODE_MODEL=qwen/qwen3-32b
-VOICE_CHAT_MODEL=llama-3.1-8b-instant
-CHAT_MODEL=llama-3.3-70b-versatile
-RESPONSE_REFINER_MODEL=llama-3.1-8b-instant
+FAST_MODEL=openai/gpt-oss-20b
+SMART_MODEL=openai/gpt-oss-120b
+DEEP_MODEL=openai/gpt-oss-120b
+CODE_MODEL=openai/gpt-oss-120b
+VOICE_CHAT_MODEL=openai/gpt-oss-20b
+CHAT_MODEL=openai/gpt-oss-120b
+RESPONSE_REFINER_MODEL=openai/gpt-oss-20b
 ENABLE_RESPONSE_REFINER=true
 ```
 
@@ -257,8 +257,8 @@ Add professional model tiers without changing app behavior yet.
 In `main.py`, add safe env variables near existing model constants:
 
 ```python
-FAST_MODEL = os.getenv("FAST_MODEL", "llama-3.1-8b-instant")
-SMART_MODEL = os.getenv("SMART_MODEL", os.getenv("CHAT_MODEL", "llama-3.3-70b-versatile"))
+FAST_MODEL = os.getenv("FAST_MODEL", "openai/gpt-oss-20b")
+SMART_MODEL = os.getenv("SMART_MODEL", os.getenv("CHAT_MODEL", "openai/gpt-oss-120b"))
 DEEP_MODEL = os.getenv("DEEP_MODEL", SMART_MODEL)
 RESPONSE_REFINER_MODEL = os.getenv("RESPONSE_REFINER_MODEL", FAST_MODEL)
 ENABLE_RESPONSE_REFINER = os.getenv("ENABLE_RESPONSE_REFINER", "false").lower() == "true"
@@ -784,12 +784,12 @@ Add or confirm:
 
 ```env
 ENABLE_RESPONSE_REFINER=false
-CHAT_MODEL=llama-3.3-70b-versatile
-SMART_MODEL=llama-3.3-70b-versatile
-DEEP_MODEL=llama-3.3-70b-versatile
-FAST_MODEL=llama-3.1-8b-instant
-CODE_MODEL=qwen/qwen3-32b
-VOICE_CHAT_MODEL=llama-3.1-8b-instant
+CHAT_MODEL=openai/gpt-oss-120b
+SMART_MODEL=openai/gpt-oss-120b
+DEEP_MODEL=openai/gpt-oss-120b
+FAST_MODEL=openai/gpt-oss-20b
+CODE_MODEL=openai/gpt-oss-120b
+VOICE_CHAT_MODEL=openai/gpt-oss-20b
 ```
 
 Keep response refiner disabled at first deployment if cost/latency matters.
